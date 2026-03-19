@@ -21,7 +21,8 @@ from dataclasses import dataclass
 AUTO_DETECT_SUBNET = True
 CUSTOM_SUBNETS = ["192.168.1.0/24"]
 
-PORT_CHECK_LIST = [
+# Default port set (used if -a and -p are not provided)
+DEFAULT_PORTS = [
     20,21,22,23,25,53,67,68,69,80,88,110,111,119,123,135,137,138,139,143,161,162,
     389,443,445,465,500,512,513,514,515,548,554,587,631,636,873,902,989,990,993,995,
     1080,1194,1433,1521,1701,1723,1812,1813,1883,1900,2049,2375,2376,3306,3389,3690,
@@ -29,8 +30,13 @@ PORT_CHECK_LIST = [
     8080,8081,8443,8530,8531,8883,9000,9042,9092,9100,9200,9300,9418,9999,11211,
     15672,27017,27018,27019
 ]
+
 TCP_TIMEOUT = 0.5
-PARALLEL = 200
+PARALLEL = 200  # host concurrency
+
+# Total concurrent TCP connection attempts across ALL hosts/ports.
+# This prevents "scan all ports" from exploding your file descriptors.
+PORT_SCAN_CONCURRENCY = 800
 
 ARP_TIMEOUT = 1.0
 ICMP_AVAILABLE = None
@@ -63,12 +69,58 @@ class Host:
 # CLI
 # ============================================================
 
+def parse_ports_list(s: str) -> list[int]:
+    """
+    Parse comma-separated ports. Supports optional ranges like 1-1024.
+    Examples: "22,80,443" or "22,80,1-1024"
+    """
+    ports: set[int] = set()
+    if not s:
+        return []
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            a = a.strip()
+            b = b.strip()
+            if not a.isdigit() or not b.isdigit():
+                raise ValueError(f"Invalid port range '{chunk}'")
+            lo = int(a)
+            hi = int(b)
+            if lo > hi:
+                lo, hi = hi, lo
+            lo = max(1, lo)
+            hi = min(65535, hi)
+            for p in range(lo, hi + 1):
+                ports.add(p)
+        else:
+            if not chunk.isdigit():
+                raise ValueError(f"Invalid port '{chunk}'")
+            p = int(chunk)
+            if 1 <= p <= 65535:
+                ports.add(p)
+            else:
+                raise ValueError(f"Port out of range: {p}")
+    return sorted(ports)
+
 def parse_args():
     p = argparse.ArgumentParser(description="netscan - simple LAN scanner (TUI)")
     p.add_argument(
         "-n", "--network",
         help="Subnet in CIDR notation, e.g. 172.16.88.0/24",
         default=None
+    )
+    p.add_argument(
+        "-a", "--all-ports",
+        action="store_true",
+        help="Scan all TCP ports 1-65535 (very slow/noisy)."
+    )
+    p.add_argument(
+        "-p", "--ports",
+        default=None,
+        help="Comma-separated ports to scan (optional ranges allowed), e.g. 22,80,443 or 1-1024,3389"
     )
     return p.parse_args()
 
@@ -359,20 +411,22 @@ async def raw_icmp_ping(ip):
         pass
     return False, None
 
-async def tcp_syn(ip, port):
-    try:
-        fut = asyncio.open_connection(ip, port)
-        r, w = await asyncio.wait_for(fut, timeout=TCP_TIMEOUT)
-        w.close()
+async def tcp_syn(ip, port, port_sem: asyncio.Semaphore):
+    # Limit total concurrent socket connection attempts across the whole scan
+    async with port_sem:
         try:
-            await w.wait_closed()
+            fut = asyncio.open_connection(ip, port)
+            r, w = await asyncio.wait_for(fut, timeout=TCP_TIMEOUT)
+            w.close()
+            try:
+                await w.wait_closed()
+            except:
+                pass
+            return True
         except:
-            pass
-        return True
-    except:
-        return False
+            return False
 
-async def hybrid_ping(ip):
+async def hybrid_ping(ip, port_sem: asyncio.Semaphore):
     global ICMP_AVAILABLE
     if ICMP_AVAILABLE is None:
         ok, ttl = await try_raw_icmp(ip)
@@ -386,8 +440,9 @@ async def hybrid_ping(ip):
         if ok:
             return True, ttl
 
+    # Fallback: try a few common ports
     for p in (80, 443, 22):
-        if await tcp_syn(ip, p):
+        if await tcp_syn(ip, p, port_sem):
             return True, 64
     return False, None
 
@@ -496,7 +551,7 @@ async def mdns_discovery():
     az = AsyncZeroconf()
     zc = az.zeroconf
     types = ["_workstation._tcp.local.", "_http._tcp.local.", "_ssh._tcp.local."]
-    browsers = [AsyncServiceBrowser(zc, t, handlers=[handler]) for t in types]
+    _browsers = [AsyncServiceBrowser(zc, t, handlers=[handler]) for t in types]
     await asyncio.sleep(MDNS_TIMEOUT)
     await az.async_close()
     return hostnames, services
@@ -567,7 +622,7 @@ def ttl_to_os(ttl):
 # MAIN SUBNET SCAN
 # ============================================================
 
-async def scan_subnet(subnet, progress):
+async def scan_subnet(subnet, progress, ports_to_scan: list[int]):
     net = ipaddress.ip_network(subnet, strict=False)
 
     progress["stage"] = "ARP discovery"
@@ -576,7 +631,6 @@ async def scan_subnet(subnet, progress):
 
     loop = asyncio.get_running_loop()
     arp_results = await loop.run_in_executor(None, arp_sweep, subnet)
-
     ips = sorted(arp_results.keys(), key=lambda x: tuple(map(int, x.split("."))))
 
     progress["stage"] = "Scanning hosts"
@@ -591,22 +645,22 @@ async def scan_subnet(subnet, progress):
 
     results = {}
     sem = asyncio.Semaphore(PARALLEL)
+    port_sem = asyncio.Semaphore(PORT_SCAN_CONCURRENCY)
 
     async def worker(ip):
         async with sem:
             mac = arp_results.get(ip, "-")
             manuf = oui_lookup(mac, oui)
 
-            alive, ttl = await hybrid_ping(ip)
+            alive, ttl = await hybrid_ping(ip, port_sem)
             os_guess = ttl_to_os(ttl)
 
             openp = []
-            for p in PORT_CHECK_LIST:
-                if await tcp_syn(ip, p):
+            for p in ports_to_scan:
+                if await tcp_syn(ip, p, port_sem):
                     openp.append(p)
 
             alive = alive or bool(openp)
-
             name = await resolve_name(ip, mdns_h, aliases, manuf, ssdp_m.get(ip, []))
 
             results[ip] = Host(
@@ -699,7 +753,6 @@ def draw_list(stdscr, hosts, idx, top):
 
     footer = f"{idx+1}/{len(hosts)}"
     _safe_addstr(stdscr, h - 1, max(0, w - len(footer) - 1), footer)
-
     stdscr.refresh()
 
 def draw_details(stdscr, hst):
@@ -763,7 +816,15 @@ def export_csv(hosts):
 def _clamp(n, lo, hi):
     return max(lo, min(hi, n))
 
-def main(stdscr, subnet_override=None):
+def determine_ports(args) -> list[int]:
+    # -a wins over -p if both supplied
+    if args.all_ports:
+        return list(range(1, 65536))
+    if args.ports:
+        return parse_ports_list(args.ports)
+    return list(DEFAULT_PORTS)
+
+def main(stdscr, subnet_override=None, ports_to_scan=None):
     curses.curs_set(0)
     stdscr.keypad(True)
 
@@ -782,13 +843,16 @@ def main(stdscr, subnet_override=None):
     except Exception as e:
         raise SystemExit(f"Invalid subnet '{subnet}': {e}")
 
+    if not ports_to_scan:
+        ports_to_scan = list(DEFAULT_PORTS)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     progress = {"done": 0, "total": 1, "stage": "starting"}
     stdscr.nodelay(True)
 
-    scan_task = loop.create_task(scan_subnet(subnet, progress))
+    scan_task = loop.create_task(scan_subnet(subnet, progress, ports_to_scan))
     while not scan_task.done():
         try:
             loop.run_until_complete(asyncio.wait_for(asyncio.shield(scan_task), timeout=0.1))
@@ -804,7 +868,7 @@ def main(stdscr, subnet_override=None):
     details = False
 
     while True:
-        h, w = stdscr.getmaxyx()
+        h, _w = stdscr.getmaxyx()
         visible = max(1, h - 3 - 1)
 
         if hosts:
@@ -857,7 +921,7 @@ def main(stdscr, subnet_override=None):
             stdscr.refresh()
         elif ch == ord("r"):
             progress = {"done": 0, "total": 1, "stage": "starting"}
-            scan_task = loop.create_task(scan_subnet(subnet, progress))
+            scan_task = loop.create_task(scan_subnet(subnet, progress, ports_to_scan))
 
             while not scan_task.done():
                 try:
@@ -874,4 +938,5 @@ def main(stdscr, subnet_override=None):
 
 if __name__ == "__main__":
     args = parse_args()
-    curses.wrapper(main, args.network)
+    ports_to_scan = determine_ports(args)
+    curses.wrapper(main, args.network, ports_to_scan)
