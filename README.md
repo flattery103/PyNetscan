@@ -2,39 +2,46 @@
 
 A standalone Linux network scanner with an interactive terminal interface, written in Python.
 
+**Version: 2.1.0**
+
 PyNetScan discovers devices, scans TCP ports, optionally probes UDP services, identifies hostnames and manufacturers, collects basic service information, and displays the results in a searchable TUI.
+
+Download one `netscan.py` file and run it. No application installation, database, or background service is required. Python, the Linux networking tools, and an interactive terminal are still needed.
+
+This README describes the behavior of [netscan.py](netscan.py) in version 2.1.0. Run `python3 netscan.py --help` to view the options supported by your downloaded copy.
 
 ## Features
 
-* Single standalone Python file
-* Interactive terminal user interface
-* Automatic local subnet detection
-* Custom CIDR network scanning
-* ARP discovery on directly connected networks
-* ICMP and TCP fallback discovery
-* Routed-network scanning
-* Quick, Standard, Deep, Full, Discovery, and Custom scan profiles
-* Custom TCP port lists and ranges
-* Optional response-based UDP probes
-* Concurrent host and port scanning
-* Live scan progress, elapsed time, rate, and estimated completion
-* Scan cancellation with partial results retained
-* Reverse DNS, NetBIOS, mDNS, and SSDP discovery
-* MAC address manufacturer lookup
-* Basic operating-system estimation
-* Estimated device-type classification
-* Basic service and banner detection
-* Security review indicators for potentially risky services
-* Search, filtering, and sorting
-* Individual-device rescanning
-* Device aliases
-* Full-subnet refresh and change comparison
-* CSV and JSON exports
-* Large-scan safety warnings
+- Single standalone Python file with an interactive terminal interface
+- Automatic local subnet detection and custom IPv4 CIDR targets
+- ARP discovery on directly connected networks, with ICMP/TCP fallback when appropriate
+- Discover, Quick, Standard, Deep, Full, and Custom scan profiles
+- Custom TCP port lists and ranges, plus optional UDP probes
+- Shared, bounded scan concurrency, adaptive timing, retries, and probe-rate controls
+- Live progress, cancellation, and partial-result retention
+- Explicit probe states and comparisons that distinguish current observations from last-known results
+- Reverse DNS, NetBIOS, optional mDNS, and SSDP discovery
+- MAC manufacturer lookup, OS estimates, device-type estimates, and basic service banners
+- Search, filtering, sorting, single-device rescanning, and editable aliases
+- CSV and JSON exports with state, timing, and completion information
+- Large-scan warnings and confirmation
+
+## What's new in 2.1.0
+
+- **More accurate results:** distinguish open, refused, no response, not scanned, and error instead of treating every unsuccessful check alike.
+- **Safer refresh comparisons:** cancelling a scan or omitting a port does not establish that a previously open port closed. Earlier positive results are retained separately as last-known information when they cannot be reverified.
+- **Improved discovery:** explicit TCP refusals count as responsiveness evidence. Use `--discovery-ports` to select discovery ports or `--skip-discovery` to check every target without a discovery prerequisite.
+- **Identification fixes:** corrected mDNS callbacks and cleanup, removed misleading SSDP names derived from USN suffixes, and added structured NetBIOS response parsing.
+- **Protocol-aware UDP results:** validate supported responses and distinguish unverified replies. Optional read-only SNMPv2c requires an explicitly supplied community; no communities are guessed.
+- **Better scheduling:** a shared worker pool distributes the connection budget across active hosts instead of imposing the previous fixed 32-TCP-workers-per-host limit.
+- **Timing and traffic controls:** add `--max-rate`, `--max-retries`, and adaptive timing overrides, with concurrency reduced when the local file-descriptor budget requires it.
+- **More complete exports:** CSV adds observation and completion fields. JSON uses schema version 2 with compact per-state port ranges.
+
+The application remains a single file. No required third-party Python dependency was added.
 
 ## Installation
 
-PyNetScan does not require a traditional installation. Download the single `netscan.py` file, make it executable, and run it.
+Download the script into the directory where you want to keep it:
 
 ```bash
 wget https://raw.githubusercontent.com/flattery103/PyNetscan/main/netscan.py
@@ -48,553 +55,528 @@ You can also run it through Python:
 python3 netscan.py
 ```
 
+Check the version:
+
+```bash
+python3 netscan.py --version
+```
+
 ## Requirements
 
-PyNetScan is designed for Linux and requires:
+PyNetScan is designed for Linux and IPv4 targets. It uses Python 3, the Linux `ip` command, and a terminal with Python curses support. Install the `ping` command for system-ping fallback and the device-details ping action.
 
-* Python 3
-* The Linux `ip` command
-* A terminal with curses support
-
-Most Linux distributions already include these components.
+Core scanning does not require a third-party Python package. mDNS uses optional `zeroconf`.
 
 ### Optional mDNS support
 
-mDNS discovery uses the optional Python `zeroconf` module.
-
-Install it with:
+Install `zeroconf` for the Python interpreter that runs PyNetScan. On Debian, the distribution package is available as [python3-zeroconf](https://packages.debian.org/trixie/python3-zeroconf):
 
 ```bash
-python3 -m pip install --user zeroconf
+sudo apt update
+sudo apt install python3-zeroconf
 ```
 
-PyNetScan will continue to work without `zeroconf`, but mDNS names and services will not be collected.
+When already logged in as root, omit `sudo`. On other distributions, use the corresponding package or an isolated Python environment appropriate for that system.
+
+Without this optional module, PyNetScan continues without mDNS results and reports a warning.
 
 ## Root privileges
 
-PyNetScan can run without root privileges.
+PyNetScan can run without root. Raw ARP and raw ICMP require suitable permissions; normal TCP connection scanning does not.
 
-Without root access, it falls back to ICMP and TCP-based discovery when raw ARP or raw ICMP sockets are unavailable.
-
-For the best discovery results on a directly connected network, run it with `sudo`:
+For local-network discovery with raw-socket access:
 
 ```bash
 sudo ./netscan.py
 ```
 
-Root privileges improve ARP and ICMP discovery but are not required for normal TCP scanning.
-
-## Starting PyNetScan
-
-Run PyNetScan without arguments to open the scan-profile menu:
+When already running as root:
 
 ```bash
 ./netscan.py
 ```
 
-PyNetScan attempts to detect the local subnet automatically.
+Container restrictions may still prevent raw-socket operations even when the process runs as root. Review the scanner's warnings rather than assuming that a scan has full raw-socket access.
 
-You can specify a network manually:
+Aliases and manufacturer caches are stored under the home directory of the account running the scanner. Running as root and running as a normal user can therefore use different saved files.
+
+## Starting PyNetScan
+
+Run without a profile or port selection to open the startup profile menu:
 
 ```bash
-./netscan.py --network 192.168.1.0/24
+./netscan.py
 ```
+
+Specify a target and profile to skip that menu:
+
+```bash
+./netscan.py --network 192.168.50.0/24 --profile standard
+```
+
+PyNetScan attempts to detect the local subnet when `--network` is omitted. If detection fails, it uses the configured fallback subnet in the script. Specify `--network` when the target must be unambiguous.
+
+A single address can be selected with `/32`:
+
+```bash
+./netscan.py --network 192.168.50.12/32 --ports 22,443
+```
+
+**This release is interactive.** `--no-menu` skips the startup menu, and `--json` enables an initial automatic export; neither provides a headless scan-and-exit mode.
 
 ## Scan profiles
 
-### Discover
+| Profile | Behavior |
+| --- | --- |
+| `discover` | Find responsive devices without a general TCP port scan. Discovery can still send ICMP and TCP probes. |
+| `quick` | Check a smaller set of common TCP services. |
+| `standard` | Check the broader built-in list of common TCP services. |
+| `deep` | Check TCP ports 1–1024 plus selected higher ports and enable basic banner detection. |
+| `full` | Check all TCP ports 1–65535 on selected hosts. This is not a full UDP scan. |
+| `custom` | Check the TCP ports supplied with `--ports`. |
 
-Find responsive devices without performing a general TCP port scan.
+Examples:
 
 ```bash
 ./netscan.py --profile discover
-```
-
-### Quick
-
-Scan a smaller set of commonly used TCP services.
-
-```bash
 ./netscan.py --profile quick
-```
-
-### Standard
-
-Scan a broad set of common TCP services. This is the recommended general-purpose profile.
-
-```bash
-./netscan.py --profile standard
-```
-
-### Deep
-
-Scan TCP ports 1 through 1024, selected higher-value ports, and collect basic service and banner information.
-
-```bash
 ./netscan.py --profile deep
-```
-
-### Full
-
-Scan all TCP ports from 1 through 65535.
-
-```bash
 ./netscan.py --profile full
-```
-
-The older `--all-ports` option is also supported:
-
-```bash
-./netscan.py --all-ports
-```
-
-Full scans can take a considerable amount of time and generate substantial network traffic.
-
-### Custom
-
-Scan a custom list of TCP ports or port ranges:
-
-```bash
-./netscan.py --ports 22,80,443,3389
-```
-
-Ranges are supported:
-
-```bash
-./netscan.py --ports 1-1024,3389,8000-8100
-```
-
-You can also explicitly select the Custom profile:
-
-```bash
 ./netscan.py --profile custom --ports 22,80,443,8000-8100
 ```
 
-## UDP probes
-
-UDP scanning is optional and separate from TCP scanning.
+`--all-ports` remains an alias for selecting all TCP ports. A port list can also be supplied without an explicit profile:
 
 ```bash
-sudo ./netscan.py \
-  --profile standard \
-  --udp-ports 53,123,137,161,1900
+./netscan.py --ports 22,80,443,3389
+./netscan.py --ports 1-1024,3389,8000-8100
 ```
 
-UDP results are listed as **responded**, not definitively open.
+Port ranges are inclusive. Port values must be within 1–65535. `--all-ports` takes precedence over `--ports`; otherwise an explicit `--ports` list overrides the profile's TCP list. A `deep` profile still enables banners when used with a custom list.
 
-A UDP service may be open but remain silent. A missing response can also indicate packet filtering. PyNetScan therefore does not label silent UDP ports as closed or open.
+## Discovery controls
+
+Directly connected networks use ARP when the necessary raw-socket access is available. Routed targets and fallback discovery use ICMP and selected TCP probes.
+
+Both a successful TCP connection and an explicit refusal provide responsiveness evidence. A refusal does **not** mean the port is open, and an intermediary may have generated the response.
+
+Select discovery ports:
+
+```bash
+./netscan.py \
+  --network 192.168.50.0/24 \
+  --profile standard \
+  --discovery-ports 22,443,8443
+```
+
+`--discovery-ports` controls the TCP discovery probes, not the subsequent general port list. ARP discovery on a directly connected network does not use that TCP list as its primary discovery method.
+
+To check every selected address without requiring discovery success:
+
+```bash
+./netscan.py \
+  --network 192.168.50.0/24 \
+  --ports 22,443,3389 \
+  --skip-discovery
+```
+
+`--scan-all-targets` is an alias for `--skip-discovery`. Supply at least one TCP or UDP port with this mode. A target is not considered responsive merely because it was selected for scanning. Large-scan safeguards still apply.
+
+## UDP probes
+
+UDP scanning is optional and separate from TCP scanning:
+
+```bash
+./netscan.py \
+  --network 192.168.50.0/24 \
+  --profile standard \
+  --udp-ports 53,123,137,1900
+```
+
+PyNetScan validates supported replies against the request and expected protocol. A verified reply is recorded as `responded`; a generic or unrecognized reply is recorded as `unverified_response` and is not listed as a verified UDP service.
+
+| Port | Probe |
+| --- | --- |
+| `53/udp` | DNS question with response validation |
+| `123/udp` | NTP request with response validation |
+| `137/udp` | NetBIOS name-service request with structured parsing |
+| `1900/udp` | SSDP discovery request with response validation |
+| `161/udp` | Optional read-only SNMPv2c request requiring an explicitly supplied community |
+| Other selected UDP ports | Generic datagram; replies remain unverified rather than proving a particular service |
+
+No response does not establish that a UDP port is open or closed. An explicit refusal is recorded separately and can originate from an intermediary.
+
+### Optional read-only SNMP
+
+The SNMP probe requests `sysDescr.0` using SNMPv2c. It does not guess communities, use an implicit default community, perform writes, or implement SNMPv3.
+
+Supply an authorized read-only community through an environment variable. For example, in Bash:
+
+```bash
+read -r -s -p "Read-only SNMP community: " NETSCAN_SNMP_COMMUNITY
+printf '\n'
+export NETSCAN_SNMP_COMMUNITY
+
+./netscan.py \
+  --network 192.168.50.0/24 \
+  --profile standard \
+  --udp-ports 161 \
+  --snmp-community-env NETSCAN_SNMP_COMMUNITY
+
+unset NETSCAN_SNMP_COMMUNITY
+```
+
+The command-line argument is the **variable name**, not the community itself. It must exist in the process that starts PyNetScan; take this into account when using `sudo`.
+
+With no community option, a selected port 161 probe is skipped and marked `unsupported`. Naming a missing or empty environment variable produces an argument error. Credentials are excluded from exported scan settings. SNMPv2c does not provide encrypted transport; use it only where appropriate on authorized management networks.
+
+## Timing, concurrency, and rate limits
+
+The shared worker pool distributes work across active hosts. The default host limit is 200 and the requested global port-concurrency limit is 800. Available file descriptors may cause PyNetScan to reduce concurrency and show a warning. Concurrency limits are not a guarantee of a particular scan speed.
+
+Timing adapts by default, starting at 0.5 seconds and using response measurements within a 0.1–2.0 second adaptive range. By default, a no-response probe can be retried once. Explicit refusals, local errors, and positive replies are not retried.
+
+Use a fixed per-attempt timeout, a probe-rate cap, and one retry:
+
+```bash
+./netscan.py \
+  --network 192.168.50.0/24 \
+  --profile standard \
+  --max-rate 200 \
+  --max-retries 1 \
+  --timeout 0.5
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--max-rate N` | Maximum TCP/UDP probe starts per second, including TCP discovery and retries. Default `0` adds no rate cap. |
+| `--max-retries N` | Extra attempts for no-response probes. Allowed range: `0`–`5`; default: `1`. |
+| `--timeout N` | Fixed positive timeout in seconds for each attempt; disables adaptive timing. |
+| `--no-adaptive-timeout` | Use a fixed 0.5-second timeout when `--timeout` is not supplied. |
+| `--concurrency N` | Requested active-host limit. |
+| `--port-concurrency N` | Requested global port-worker/connection budget. |
+
+**`--max-rate` is not a total packet-rate limit.** ARP, ICMP, multicast discovery, name resolution, and banner collection are separate traffic. A probe can also involve multiple packets.
 
 ## Common examples
 
-Scan the automatically detected subnet with the Standard profile:
+Run a general inventory:
 
 ```bash
-./netscan.py --profile standard
+./netscan.py --network 192.168.50.0/24 --profile standard
 ```
 
-Scan a specific network:
+Enable banner collection without selecting Deep:
 
 ```bash
-./netscan.py \
-  --network 192.168.50.0/24 \
-  --profile standard
+./netscan.py --network 192.168.50.0/24 --profile standard --banners
 ```
 
-Run a fast scan:
+Request a particular interface for route selection and ARP:
 
 ```bash
-./netscan.py \
-  --network 192.168.50.0/24 \
-  --profile quick
+./netscan.py --network 192.168.50.0/24 --interface ens18 --profile quick
 ```
 
-Run a Deep scan with banner detection:
+**Interface limitation:** version 2.1.0 does not bind every TCP, UDP, ICMP, or multicast operation to the requested interface. Do not rely on `--interface` as an all-traffic isolation guarantee; verify routing on multi-interface or VPN systems.
 
-```bash
-sudo ./netscan.py \
-  --network 192.168.50.0/24 \
-  --profile deep
-```
-
-Enable banner detection with the Standard profile:
+Perform a small loopback check without optional discovery/enrichment:
 
 ```bash
 ./netscan.py \
-  --profile standard \
-  --banners
+  --network 127.0.0.1/32 \
+  --ports 22,443 \
+  --skip-discovery \
+  --no-dns --no-mdns --no-ssdp --no-oui \
+  --max-rate 10 --max-retries 0
 ```
 
-Scan selected TCP and UDP ports:
-
-```bash
-sudo ./netscan.py \
-  --network 192.168.50.0/24 \
-  --ports 22,53,80,443,445,3389 \
-  --udp-ports 53,123,161
-```
-
-Use a specific network interface:
-
-```bash
-sudo ./netscan.py \
-  --network 192.168.50.0/24 \
-  --interface ens18
-```
-
-Run the Standard profile without displaying the startup menu:
+Start the Standard profile without the startup menu:
 
 ```bash
 ./netscan.py --no-menu
-```
-
-Automatically export JSON after the scan:
-
-```bash
-./netscan.py \
-  --profile standard \
-  --json
-```
-
-Specify an export filename:
-
-```bash
-./netscan.py \
-  --profile standard \
-  --output office-network-scan
 ```
 
 ## Command-line options
 
 ```text
 usage: netscan.py [-h] [-n NETWORK]
-                  [--profile {discover,quick,standard,deep,full,custom}]
-                  [-a] [-p PORTS] [--udp-ports UDP_PORTS]
-                  [--interface INTERFACE] [--timeout TIMEOUT]
-                  [--concurrency CONCURRENCY]
+                  [--profile {discover,quick,standard,deep,full,custom}] [-a]
+                  [-p PORTS] [--udp-ports UDP_PORTS] [--interface INTERFACE]
+                  [--timeout TIMEOUT] [--concurrency CONCURRENCY]
                   [--port-concurrency PORT_CONCURRENCY]
-                  [--no-dns] [--no-mdns] [--no-ssdp]
-                  [--banners] [--output OUTPUT] [--json]
-                  [--force] [--no-menu] [--update-oui]
-                  [--no-oui] [--version]
+                  [--discovery-ports DISCOVERY_PORTS] [--skip-discovery]
+                  [--max-rate MAX_RATE] [--max-retries MAX_RETRIES]
+                  [--no-adaptive-timeout] [--snmp-community-env VARIABLE]
+                  [--no-dns] [--no-mdns] [--no-ssdp] [--banners]
+                  [--output OUTPUT] [--json] [--force] [--no-menu]
+                  [--update-oui] [--no-oui] [--version]
 
 PyNetScan - standalone Linux network scanner with a TUI
 
 options:
-  -h, --help
-      Show the help message and exit.
-
+  -h, --help            show this help message and exit
   -n, --network NETWORK
-      Subnet in CIDR notation, such as 192.168.1.0/24.
-
+                        Subnet in CIDR notation
   --profile {discover,quick,standard,deep,full,custom}
-      Select a scan profile and skip the startup profile menu.
-
-  -a, --all-ports
-      Scan all TCP ports from 1 through 65535. Equivalent to
-      --profile full.
-
-  -p, --ports PORTS
-      Custom TCP ports or ranges, such as
-      22,80,443,8000-8100.
-
+                        Scan profile; supplying this skips the startup profile
+                        menu
+  -a, --all-ports       Scan all TCP ports 1-65535 (equivalent to --profile
+                        full)
+  -p, --ports PORTS     Custom TCP ports/ranges, for example
+                        22,80,443,8000-8100
   --udp-ports UDP_PORTS
-      Optional response-based UDP probes, such as
-      53,123,137,161,1900.
-
+                        Optional response-based UDP probes, for example
+                        53,123,137,161,1900
   --interface INTERFACE
-      Network interface to use, such as ens18.
-
-  --timeout TIMEOUT
-      TCP and UDP timeout in seconds. Default: 0.5.
-
+                        Network interface to use, for example ens18
+  --timeout TIMEOUT     Fixed per-attempt TCP/UDP timeout; disables adaptive
+                        timing (default starts at 0.5s)
   --concurrency CONCURRENCY
-      Maximum number of hosts processed concurrently.
-      Default: 200.
-
+                        Concurrent hosts (default: 200)
   --port-concurrency PORT_CONCURRENCY
-      Maximum number of concurrent TCP connection attempts.
-      Default: 800.
-
-  --no-dns
-      Disable reverse DNS lookups.
-
-  --no-mdns
-      Disable mDNS discovery.
-
-  --no-ssdp
-      Disable SSDP discovery.
-
-  --banners
-      Enable basic service and banner detection.
-
-  --output OUTPUT
-      Preferred export filename or base path.
-
-  --json
-      Automatically export JSON after scanning.
-
-  --force
-      Skip large-scan confirmation.
-
-  --no-menu
-      Use the Standard profile without opening the startup menu.
-
-  --update-oui
-      Force an update of the IEEE manufacturer database.
-
-  --no-oui
-      Disable MAC address manufacturer lookups.
-
-  --version
-      Display the PyNetScan version and exit.
+                        Total concurrent TCP attempts (default: 800)
+  --discovery-ports DISCOVERY_PORTS
+                        TCP discovery ports/ranges; an explicit refusal also
+                        proves responsiveness
+  --skip-discovery, --scan-all-targets
+                        Scan every target even when discovery probes would
+                        fail
+  --max-rate MAX_RATE   Maximum TCP/UDP probe attempts/sec, including
+                        discovery and retries (0: unlimited)
+  --max-retries MAX_RETRIES
+                        Retries for no-response probes only, 0-5 (default: 1)
+  --no-adaptive-timeout
+                        Use the default fixed timeout instead of adapting to
+                        measured responses
+  --snmp-community-env VARIABLE
+                        Environment variable containing an explicitly supplied
+                        read-only SNMPv2c community; never guessed
+  --no-dns              Disable reverse DNS
+  --no-mdns             Disable mDNS discovery
+  --no-ssdp             Disable SSDP discovery
+  --banners             Enable basic service/banner detection
+  --output OUTPUT       Preferred export filename or base path
+  --json                Automatically export JSON after scanning
+  --force               Skip large-scan confirmation
+  --no-menu             Use the standard profile without a startup menu
+  --update-oui          Force an IEEE OUI database refresh
+  --no-oui              Disable manufacturer lookups
+  --version             show program's version number and exit
 ```
+
+`--no-dns` disables reverse DNS, not every naming mechanism. NetBIOS is separate, as are mDNS and SSDP with their own flags. Likewise, `--no-ssdp` disables multicast SSDP discovery; it does not remove an explicit `1900` from `--udp-ports`.
 
 ## TUI keyboard controls
 
 ### Device list
 
-| Key                 | Action                                |
-| ------------------- | ------------------------------------- |
-| Up / Down           | Select a device                       |
-| Page Up / Page Down | Move through the device list          |
-| Enter               | Open details for the selected device  |
-| `/`                 | Search the current results            |
-| `x`                 | Clear the current search              |
-| `f`                 | Cycle through result filters          |
-| `o`                 | Cycle through sort modes              |
-| `r`                 | Refresh the entire subnet             |
-| `s`                 | Rescan only the selected device       |
-| `a`                 | Add, change, or remove a device alias |
-| `e`                 | Export results to CSV                 |
-| `j`                 | Export results to JSON                |
-| `?`                 | Open the help screen                  |
-| `q`                 | Quit                                  |
+| Key | Action |
+| --- | --- |
+| Up / Down | Select a device |
+| Page Up / Page Down | Move through the list |
+| Enter | Open device details |
+| `/` | Search results |
+| `x` | Clear the search |
+| `f` | Cycle result filters |
+| `o` | Cycle sort modes |
+| `r` | Rescan the subnet and compare results |
+| `s` | Rescan only the selected device |
+| `a` | Add, change, or remove an alias |
+| `e` | Export the report to CSV |
+| `j` | Export the report to JSON |
+| `?` | Open help |
+| `q` | Quit |
 
 ### Device details
 
-| Key                 | Action                           |
-| ------------------- | -------------------------------- |
-| Up / Down           | Scroll through details           |
-| Page Up / Page Down | Scroll one page                  |
-| Home / End          | Jump to the beginning or end     |
-| `p`                 | Ping the selected device         |
-| `s`                 | Rescan the selected device       |
-| `a`                 | Add, change, or remove its alias |
-| `b`                 | Return to the device list        |
-| `q`                 | Quit                             |
+| Key | Action |
+| --- | --- |
+| Up / Down | Scroll details |
+| Page Up / Page Down | Scroll one page |
+| Home / End | Jump to the beginning or end |
+| `p` | Ping the selected device |
+| `s` | Rescan the selected device |
+| `a` | Edit its alias |
+| `b` | Return to the device list |
+| `q` | Quit |
 
 ### During a scan
 
-Press `q` to cancel the active scan.
+Press `q` to cancel. PyNetScan stops queued and active work, cleans up scan resources, and retains observations already collected. Remaining work is not silently treated as completed.
 
-PyNetScan keeps the partial results gathered before cancellation so they can still be reviewed or exported.
+Details and exports record discovery, TCP, UDP, and identification completion separately. Cancelling also stops optional identification instead of requiring it to finish first.
 
 ## Search, filters, and sorting
 
-Search can match:
+Search is a case-insensitive text match across IP, name/alias, MAC, manufacturer, OS guess, device type, and currently observed TCP/verified UDP ports.
 
-* IP address
-* Device name or alias
-* MAC address
-* Manufacturer
-* Operating-system guess
-* Device type
-* Open port
+Press `f` to cycle through `all`, `open`, `review`, `changed`, `new`, `not_observed`, `partial`, and `errors`.
 
-Press `f` to cycle through these filters:
+The `open` filter shows current open TCP ports or verified UDP responses, not historical-only ports. The `partial` filter includes incomplete and not-scanned devices. The `changed` filter includes hosts with comparison notes, including uncertainty notes.
 
-* All devices
-* Devices with open or responding ports
-* Devices with services requiring review
-* Changed devices
-* New devices
-* Offline devices
+Press `o` to sort by IP, name, manufacturer, OS, current port count, or status.
 
-Press `o` to cycle through available sort modes, including:
+## Probe states
 
-* IP address
-* Device name
-* Manufacturer
-* Operating-system guess
-* Number of detected ports
-* Change status
+TCP and UDP observations are more detailed than a list of detected ports:
+
+| State | Meaning |
+| --- | --- |
+| `open` | A TCP connection succeeded. This alone does not verify the application protocol. |
+| `refused` | An explicit connection refusal was received. This is distinct from silence; an intermediary may generate it. |
+| `no_response` | No accepted reply arrived before the configured attempts timed out. |
+| `not_scanned` | No completed observation is recorded for the port, for example because it was out of scope or interrupted. |
+| `error` | A probe failed with a reported local, socket, or routing error rather than a usable service result. |
+| `responded` | A UDP reply passed the supported protocol checks. |
+| `unverified_response` | A reply arrived but did not establish a verified supported UDP service. |
+| `unsupported` | The requested probe could not be performed, such as SNMP without a supplied community. |
+
+**A timeout, cancelled probe, or omitted port is not evidence that a service closed.**
 
 ## Refresh and change tracking
 
-Press `r` to scan the subnet again.
+Press `r` to compare a new scan with the current report in the same running session. Press `s` for a single-device recheck.
 
-PyNetScan compares the new scan with the previous results and identifies:
+Comparisons identify newly observed ports, explicitly refused ports, returning devices, and supported name/MAC changes. When a previously observed service cannot be reverified, it is retained in **last-known** fields rather than being presented as newly confirmed open or closed.
 
-* New devices
-* Returning devices
-* Devices that no longer respond
-* Newly detected TCP ports
-* TCP ports that are no longer detected
-* Newly responding UDP ports
-* UDP ports that stopped responding
-* Changed names, MAC addresses, or device information
+For example, if an earlier scan observed ports 22 and 443, and a new scan checks only 22 before cancellation, port 443 remains last-known. It is not reported closed merely because the new open-port list omits it.
 
-Result symbols include:
+Host statuses include:
+
+| Status | Meaning |
+| --- | --- |
+| `CURRENT` | The host's available evidence and completion state qualify it as a current result. |
+| `NEW` | A newly observed responsive device relative to the previous report, with the required stages complete. |
+| `CHANGED` | A current result with comparison notes. Read the notes to distinguish observations from uncertainty. |
+| `PARTIAL` | The result is incomplete, including interrupted scanning or identification. |
+| `NOT_OBSERVED` | The device was not observed by the completed discovery checks that applied to it; this does not prove an outage. |
+| `NOT_SCANNED` | The device was not conclusively checked, or is outside the new scan's scope. |
+| `ERROR` | Discovery or probe errors affect the result. |
+
+The initial scan has no earlier report to compare against. New-device marking is a comparison feature, not a label automatically applied to every first-scan row.
+
+Result symbols:
 
 ```text
 +  New device
 *  Changed device
--  Offline device
-!  Service may require security review
+-  Not observed
+?  Incomplete or not scanned
+E  Error
+!  Service deserves review; not proof of a vulnerability
 ```
+
+Historical-only ports and carried-forward identity information are not new measurements. Last-observed times are separate from scan-completion times. Comparisons are in-memory; this release does not load a saved JSON baseline.
 
 ## Device aliases
 
-Press `a` while a device is selected to add or change its alias.
+Press `a` to add or change an alias. A blank value removes it.
 
-Aliases are stored in:
+Aliases are keyed by IP address and stored in:
 
 ```text
 ~/.config/netscan/aliases.json
 ```
 
-Entering a blank alias removes the saved alias.
+The `~` directory belongs to the account running the scanner. For root, this is `/root`.
 
 ## Manufacturer database
 
-PyNetScan uses the IEEE OUI database to identify device manufacturers from MAC addresses.
-
-The local cache is stored in:
+PyNetScan uses the IEEE OUI database to look up MAC manufacturers. Its cache is stored in:
 
 ```text
 ~/.cache/netscan/oui.json
 ```
 
-The database is refreshed automatically when it becomes outdated.
-
-Force an update with:
+It refreshes automatically after its configured maximum age, which defaults to 30 days. Request a refresh or disable lookups with:
 
 ```bash
 ./netscan.py --update-oui
-```
-
-Disable manufacturer lookups with:
-
-```bash
 ./netscan.py --no-oui
 ```
 
-If the database cannot be downloaded, PyNetScan continues scanning without manufacturer information.
+These options apply when a scan runs; they are not separate update-and-exit commands. A download failure is reported, and usable cached information can remain available.
 
 ## Exports
 
-Press `e` to export CSV or `j` to export JSON.
+Press `e` for CSV or `j` for JSON. Exports contain the full report, not only the filtered rows visible on screen.
 
-By default, PyNetScan creates timestamped filenames such as:
+Default names include the subnet and export timestamp:
 
 ```text
-pynetscan_192.168.1.0-24_2026-07-16_143500.csv
-pynetscan_192.168.1.0-24_2026-07-16_143500.json
+pynetscan_192.168.1.0-24_2026-09-25_143500.csv
+pynetscan_192.168.1.0-24_2026-09-25_143500.json
 ```
 
-CSV exports include fields such as:
-
-* IP address
-* Status and detected changes
-* Device name and type
-* MAC address and manufacturer
-* Operating-system guess
-* Discovery method
-* TCP ports
-* Responding UDP ports
-* Security review items
-* Service banners
-* mDNS information
-* SSDP information
-
-JSON exports also include scan settings, timestamps, route information, warnings, and structured device details.
-
-Use `--output` to choose a filename or base path:
+Choose a filename or base path with `--output`. Create the parent directory first:
 
 ```bash
-./netscan.py \
-  --profile standard \
-  --output scans/office-network
+mkdir -p scans
+./netscan.py --profile standard --output scans/office-network
 ```
 
-This produces the applicable extension:
+Pressing `e` writes `scans/office-network.csv`; pressing `j` writes `scans/office-network.json`.
 
-```text
-scans/office-network.csv
-scans/office-network.json
+**`--output` by itself does not trigger an export.** Add `--json` to automatically export after the initial scan, then remain in the TUI:
+
+```bash
+mkdir -p scans
+./netscan.py --profile standard --output scans/office-network.json --json
 ```
+
+Exports write to the selected path and can replace an existing file. Use distinct paths to retain older reports. Even default timestamped names can collide if exports of the same type occur within one second.
+
+### CSV
+
+The original inventory columns remain, with additional columns for reachability, last-seen time, host completion/cancellation, per-stage completion, requested port counts, probe-state summaries, last-known ports, and probe details.
+
+Existing consumers that assume an exact column count should be updated for the appended columns. The `TCP Ports` and `UDP Responded` columns contain current observations; last-known ports have separate columns.
+
+### JSON
+
+JSON uses **`schema_version: 2`**. It includes scan scope/settings, warnings, discovery outcomes, cancellation, and per-host observations.
+
+`tcp_results` and `udp_results` encode observations in `state_ranges`. Range strings use comma-separated ports and inclusive ranges, such as `22,80,443,8000-8010`. A missing port defaults to `not_scanned`, not `refused` or closed. Use the report's `tcp_ports` and `udp_ports` to determine the requested scope.
+
+The compatibility field `open_udp_ports` contains verified UDP responders; it is not a conclusion about silent UDP ports. Credentials are not included in exported scan settings.
 
 ## Large scans
 
-PyNetScan warns before starting scans that involve unusually large networks or very high numbers of connection attempts.
+PyNetScan estimates scan work and warns about large address ranges or high attempt counts. The estimate includes discovery and retry work. A full TCP scan across all usable addresses in a `/24` can exceed 16 million initial port checks before retries.
 
-A Full scan of an entire `/24` network can involve more than 16 million TCP connection attempts and may take a considerable amount of time.
-
-Use `--force` only when you understand the size and impact of the requested scan:
-
-```bash
-sudo ./netscan.py \
-  --network 192.168.1.0/24 \
-  --profile full \
-  --force
-```
-
-Consider scanning a smaller address range or a targeted list of ports whenever possible.
+`--force` bypasses confirmation; it does not reduce the traffic or authorize the scan. Prefer a small target range and selected ports while validating settings.
 
 ## Detection limitations
 
-PyNetScan provides useful network inventory information, but several results are estimates.
-
 ### Operating-system guesses
 
-Operating-system identification is primarily based on the TTL from an ICMP response.
+OS estimates use observed ICMP TTLs and are not definitive fingerprints. A successful TCP-only discovery does not manufacture a TTL; without a real ICMP result, the OS remains unknown.
 
-Firewalls, routers, virtualization, and customized network stacks can make these guesses inaccurate.
+### Device types and service names
 
-Devices discovered only through TCP are reported as having an unknown operating system unless a real ICMP TTL was received.
+Device types are estimates based on available names, manufacturers, ports, and discovery information. Conventional service names beside port numbers are hints, not proof that the expected application is listening. Basic banners provide additional observations but are not comprehensive service or vulnerability checks.
 
-### Device types
+### Identification and UDP
 
-Device types are estimated using available information such as:
+mDNS requires its optional library and appropriate network reachability. SSDP names are accepted from explicit friendly-name metadata, not arbitrary USN suffixes. This release does not fetch SSDP device-description URLs for friendly names.
 
-* Open ports
-* Manufacturer
-* Hostname
-* mDNS services
-* SSDP information
-* Service banners
-
-These classifications should be treated as likely device types rather than definitive identification.
+UDP protocol validation distinguishes supported replies from generic or malformed responses. Silent or unverified services can be missed, so a missing verified UDP response is not evidence of closure.
 
 ### Security review indicators
 
-PyNetScan highlights services that may deserve review, such as:
+Review markers identify services worth inspecting, not verified vulnerabilities, authentication weaknesses, or proof of encryption settings. Assess access controls and the actual service configuration separately.
 
-* Telnet
-* FTP
-* SMB
-* RDP
-* VNC
-* Database listeners
-* Redis
-* MongoDB
-* Elasticsearch
-* Docker API
+### Scope and operation
 
-A review indicator does not prove that a vulnerability exists. It means the detected service may warrant additional inspection or access-control verification.
-
-### UDP probes
-
-UDP results only show ports that returned a recognizable response. Silent UDP ports are not marked open or closed.
+This release supports IPv4 on Linux, requires an interactive terminal, and does not include saved-baseline loading, comprehensive certificate assessment, or guaranteed interface binding for every type of traffic.
 
 ## Authorized use
 
-Only scan networks and systems that you own or have explicit permission to test.
+Only scan networks and systems that you own or have explicit permission to test. Use conservative targets and limits appropriate for the environment. Scans can trigger monitoring and create substantial traffic.
 
-Network scanning can trigger monitoring systems, generate significant traffic, or violate organizational policies when performed without authorization.
+Reports can contain sensitive device names, addresses, and service information. Keep real network exports and credentials out of public repositories.
 
 ## License
 
-PyNetScan is licensed under the GNU General Public License version 3.
-
-See the `LICENSE` file for the complete license text.
+PyNetScan is licensed under the GNU General Public License version 3. See [LICENSE](LICENSE) for the full license text.
