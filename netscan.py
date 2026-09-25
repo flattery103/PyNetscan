@@ -13,6 +13,9 @@ import asyncio
 import copy
 import csv
 import errno
+import gzip
+import html
+import io
 import math
 import secrets
 import threading
@@ -30,6 +33,7 @@ import subprocess
 import textwrap
 import time
 import urllib.request
+import urllib.parse
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -38,7 +42,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 # VERSION / CONFIG
 # ============================================================
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 APP_NAME = "PyNetScan"
 
 AUTO_DETECT_SUBNET = True
@@ -79,6 +83,9 @@ ARP_BATCH_SIZE = 64
 ARP_BATCH_LISTEN = 0.03
 
 OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
+OUI_FALLBACK_URL = "https://www.wireshark.org/download/automated/data/manuf.gz"
+OUI_MIN_ASSIGNMENTS = 1000
+OUI_MAX_BYTES = 32 * 1024 * 1024
 OUI_CACHE_FILE = os.path.expanduser("~/.cache/netscan/oui.json")
 OUI_MAX_AGE_DAYS = 30
 ALIASES_FILE = os.path.expanduser("~/.config/netscan/aliases.json")
@@ -150,9 +157,9 @@ REVIEW_TCP_PORTS = {
 
 HTTP_PORTS = {
     80, 443, 2375, 2376, 5985, 5986, 6443, 8000, 8008, 8080, 8081,
-    8443, 8530, 8531, 9000, 9200, 15672,
+    8092, 8443, 8530, 8531, 9000, 9200, 15672,
 }
-HTTPS_PORTS = {443, 2376, 5986, 6443, 8443, 8531}
+HTTPS_PORTS = {443, 2376, 5986, 6443, 8092, 8443, 8531}
 GREETING_PORTS = {21, 22, 25, 110, 143, 465, 587, 993, 995}
 
 # ============================================================
@@ -283,6 +290,15 @@ class Host:
     udp_results: PortResults = field(default_factory=PortResults)
     last_known_tcp_ports: List[int] = field(default_factory=list)
     last_known_udp_ports: List[int] = field(default_factory=list)
+    name_source: str = "Not discovered"
+    name_is_inferred: bool = False
+    resolved_name: str = ""
+    vendor_guess: str = ""
+    identification_evidence: List[str] = field(default_factory=list)
+    web_observations: List[Dict[str, object]] = field(default_factory=list)
+    web_identification_status: str = "not_requested"
+    manufacturer_lookup_status: str = "not_requested"
+    manufacturer_source: str = ""
 
     @property
     def open_ports(self) -> List[int]:
@@ -313,6 +329,7 @@ class ScanOptions:
     enable_mdns: bool = True
     enable_ssdp: bool = True
     enable_banners: bool = False
+    enable_web_identification: bool = False
     force: bool = False
     update_oui: bool = False
     enable_oui: bool = True
@@ -428,7 +445,9 @@ def parse_args():
     parser.add_argument("--no-dns", action="store_true", help="Disable reverse DNS")
     parser.add_argument("--no-mdns", action="store_true", help="Disable mDNS discovery")
     parser.add_argument("--no-ssdp", action="store_true", help="Disable SSDP discovery")
-    parser.add_argument("--banners", action="store_true", help="Enable basic service/banner detection")
+    parser.add_argument("--banners", action="store_true", help="Enable service greetings and web identification")
+    parser.add_argument("--no-web-identification", action="store_true",
+                        help="Disable HTTP identity/redirect requests (automatic for Standard/Deep)")
     parser.add_argument("--output", help="Preferred export filename or base path")
     parser.add_argument("--json", action="store_true", help="Automatically export JSON after scanning")
     parser.add_argument("--force", action="store_true", help="Skip large-scan confirmation")
@@ -599,84 +618,206 @@ def save_aliases(aliases: Dict[str, str]) -> None:
 # OUI MANUFACTURER DATABASE
 # ============================================================
 
+def clean_identity_text(value: str, limit: int = 200) -> str:
+    value = "".join(char for char in str(value) if char.isprintable() or char in "\t\r\n")
+    return " ".join(value.split())[:limit]
+
+
+class OUIDatabase(dict):
+    """Dictionary-compatible mappings with provenance, including legacy caches."""
+    def __init__(self, mappings=(), source: str = "Legacy cache"):
+        super().__init__(mappings)
+        self.source = source
+
+
+def valid_oui_mappings(value) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {key.upper(): clean_identity_text(name, 200)
+            for key, name in value.items()
+            if isinstance(key, str) and re.fullmatch(r"[0-9A-Fa-f]{6}|[0-9A-Fa-f]{7}|[0-9A-Fa-f]{9}", key)
+            and isinstance(name, str) and clean_identity_text(name, 200)}
+
+
 def load_oui_cache() -> Tuple[Dict[str, str], bool]:
     try:
+        if os.path.getsize(OUI_CACHE_FILE) > OUI_MAX_BYTES:
+            return OUIDatabase(), False
         with open(OUI_CACHE_FILE, encoding="utf-8") as file_handle:
             data = json.load(file_handle)
+        source = "Legacy cache"
+        if isinstance(data, dict) and data.get("format_version") == 2:
+            source = clean_identity_text(str(data.get("source", "Cached database")), 120)
+            data = data.get("assignments")
+        mappings = OUIDatabase(valid_oui_mappings(data), source)
         age_seconds = time.time() - os.path.getmtime(OUI_CACHE_FILE)
-        fresh = age_seconds <= OUI_MAX_AGE_DAYS * 86400
-        return (data if isinstance(data, dict) else {}), fresh
+        fresh = 0 <= age_seconds <= OUI_MAX_AGE_DAYS * 86400
+        return mappings, fresh
     except (OSError, ValueError, TypeError):
-        return {}, False
+        return OUIDatabase(), False
 
 
 def save_oui(data: Dict[str, str]) -> None:
+    mappings = valid_oui_mappings(data)
+    if not mappings:
+        raise ValueError("Refusing to replace the OUI cache with empty or invalid data")
     os.makedirs(os.path.dirname(OUI_CACHE_FILE), exist_ok=True)
-    temp_file = OUI_CACHE_FILE + ".tmp"
-    with open(temp_file, "w", encoding="utf-8") as file_handle:
-        json.dump(data, file_handle)
-    os.replace(temp_file, OUI_CACHE_FILE)
+    temp_file = OUI_CACHE_FILE + "." + secrets.token_hex(6) + ".tmp"
+    try:
+        with open(temp_file, "x", encoding="utf-8") as file_handle:
+            json.dump({"format_version": 2, "source": getattr(data, "source", "Imported database"),
+                       "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+                       "assignments": mappings}, file_handle)
+        os.replace(temp_file, OUI_CACHE_FILE)
+    finally:
+        try:
+            os.unlink(temp_file)
+        except FileNotFoundError:
+            pass
+
+
+def parse_oui_data(text: str, source_format: str) -> Dict[str, str]:
+    """Parse upstream data, never HTML/block pages, including 28/36-bit entries."""
+    mappings: Dict[str, str] = {}
+    if source_format == "ieee":
+        reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
+        if not {"Assignment", "Organization Name"}.issubset(set(reader.fieldnames or [])):
+            raise ValueError("IEEE download is not an assignment CSV")
+        for row in reader:
+            key = (row.get("Assignment") or "").replace("-", "").replace(":", "").upper()
+            name = clean_identity_text(row.get("Organization Name") or "", 200)
+            if re.fullmatch(r"[0-9A-F]{6}|[0-9A-F]{7}|[0-9A-F]{9}", key) and name:
+                mappings[key] = name
+    elif source_format == "wireshark":
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            columns = line.split(None, 2)
+            if len(columns) < 3:
+                continue
+            block, _, long_name = columns
+            base, separator, mask_text = block.partition("/")
+            if not re.fullmatch(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){2,5}", base):
+                continue
+            if separator and not mask_text.isdigit():
+                continue
+            bits = int(mask_text) if separator else 24
+            key = base.replace(":", "").upper()
+            if not separator and len(key) != 6:
+                continue  # A full unmasked MAC is not a 24-bit vendor allocation.
+            if bits not in (24, 28, 36) or len(key) * 4 < bits:
+                continue
+            key = key[:bits // 4]
+            name = clean_identity_text(long_name, 200)
+            if name:
+                mappings[key] = name
+    else:
+        raise ValueError("Unknown manufacturer database format")
+    if not mappings:
+        raise ValueError("Manufacturer download contains no valid assignments")
+    return mappings
+
+
+class OUIRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Only trusted HTTPS publisher/mirror hosts may redirect database requests."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
+        if (urllib.parse.urlsplit(newurl).scheme != "https" or
+                not (host == "standards-oui.ieee.org" or host == "wireshark.org"
+                     or host.endswith(".wireshark.org"))):
+            raise ValueError("Manufacturer source redirected outside trusted HTTPS publishers")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_oui_text(url: str, cancel_event: Optional[asyncio.Event] = None) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": f"PyNetScan/{VERSION}",
+                                                  "Accept-Encoding": "identity"})
+    deadline = time.monotonic() + 12.0
+    chunks: List[bytes] = []
+    size = 0
+    opener = urllib.request.build_opener(OUIRedirectHandler())
+    with opener.open(request, timeout=3.0) as response:
+        if response.status != 200:
+            raise ValueError(f"Unexpected manufacturer download HTTP status {response.status}")
+        length_text = response.headers.get("Content-Length")
+        expected = None
+        if length_text is not None:
+            if not re.fullmatch(r"[0-9]{1,20}", length_text):
+                raise ValueError("Invalid manufacturer download Content-Length")
+            expected = int(length_text)
+            if expected > OUI_MAX_BYTES:
+                raise ValueError("Manufacturer download exceeds size limit")
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Manufacturer refresh cancelled")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Manufacturer download exceeded its time budget")
+            chunk = getattr(response, "read1", response.read)(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > OUI_MAX_BYTES:
+                raise ValueError("Manufacturer download exceeds size limit")
+            chunks.append(chunk)
+        if expected is not None and size != expected:
+            raise ValueError("Incomplete manufacturer download; Content-Length mismatch")
+    data = b"".join(chunks)
+    if data.startswith(b"\x1f\x8b"):
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+            data = compressed.read(OUI_MAX_BYTES + 1)
+        if len(data) > OUI_MAX_BYTES:
+            raise ValueError("Expanded manufacturer database exceeds size limit")
+    return data.decode("utf-8-sig", "strict")
 
 
 def update_oui_database(cancel_event: Optional[asyncio.Event] = None) -> Tuple[Dict[str, str], Optional[str]]:
-    try:
-        chunks = []
-        size = 0
-        with urllib.request.urlopen(OUI_URL, timeout=3.0) as response:
-            while not (cancel_event is not None and cancel_event.is_set()):
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-                if size > 32 * 1024 * 1024:
-                    raise ValueError("OUI download exceeds 32 MiB")
+    errors: List[str] = []
+    for source, url, source_format in (
+        ("IEEE MA-L", OUI_URL, "ieee"),
+        ("Wireshark manufacturer database", OUI_FALLBACK_URL, "wireshark"),
+    ):
         if cancel_event is not None and cancel_event.is_set():
-            return {}, "OUI refresh cancelled"
-        text = b"".join(chunks).decode("utf-8", "replace")
-    except Exception as exc:  # Network errors vary by Python/platform.
-        return {}, f"OUI update failed: {exc}"
-
-    mappings: Dict[str, str] = {}
-    try:
-        reader = csv.DictReader(text.splitlines())
-        for row in reader:
-            assignment = (row.get("Assignment") or "").replace("-", "").replace(":", "").upper()
-            organization = (row.get("Organization Name") or "").strip()
-            if len(assignment) == 6 and organization:
-                mappings[assignment] = organization
-    except (csv.Error, TypeError) as exc:
-        return {}, f"OUI data could not be parsed: {exc}"
-
-    if not mappings:
-        return {}, "OUI update returned no usable assignments"
-    try:
-        if cancel_event is None or not cancel_event.is_set():
-            save_oui(mappings)
-    except OSError as exc:
-        return mappings, f"OUI cache could not be saved: {exc}"
-    return mappings, None
+            return OUIDatabase(), "Manufacturer refresh cancelled"
+        try:
+            text = download_oui_text(url, cancel_event)
+            mappings = OUIDatabase(parse_oui_data(text, source_format), source)
+            if len(mappings) < OUI_MIN_ASSIGNMENTS:
+                raise ValueError(f"Only {len(mappings)} assignments; incomplete download rejected")
+            if cancel_event is not None and cancel_event.is_set():
+                return OUIDatabase(), "Manufacturer refresh cancelled"
+            warning = "; ".join(errors + [f"using {source} fallback"]) if errors else None
+            try:
+                save_oui(mappings)
+            except (OSError, ValueError) as exc:
+                warning = (warning + "; " if warning else "") + f"Manufacturer cache could not be saved: {exc}"
+            return mappings, warning
+        except Exception as exc:
+            errors.append(f"{source} update failed: {clean_identity_text(str(exc), 200)}")
+    return OUIDatabase(), "Manufacturer database unavailable: " + "; ".join(errors)
 
 
 def get_oui_database(force_update: bool = False, cancel_event: Optional[asyncio.Event] = None) -> Tuple[Dict[str, str], Optional[str]]:
     cached, fresh = load_oui_cache()
     if cached and fresh and not force_update:
         return cached, None
-
     updated, warning = update_oui_database(cancel_event)
     if updated:
         return updated, warning
     if cached:
-        fallback_warning = warning or "OUI refresh failed"
-        return cached, f"{fallback_warning}; using the existing cache"
-    return {}, warning or "Manufacturer database unavailable"
+        return cached, f"{warning or 'Manufacturer refresh failed'}; using the existing cache"
+    return OUIDatabase(), warning or "Manufacturer database unavailable"
 
 
 def oui_lookup(mac: str, oui: Dict[str, str]) -> str:
     normalized = mac.replace(":", "").replace("-", "").upper()
-    if len(normalized) < 6:
+    if not re.fullmatch(r"[0-9A-F]{12}", normalized):
         return "-"
-    return oui.get(normalized[:6], "-")
+    for length in (9, 7, 6):
+        if normalized[:length] in oui:
+            return oui[normalized[:length]]
+    return "-"
+
 
 # ============================================================
 # RAW ARP DISCOVERY
@@ -1765,59 +1906,417 @@ def review_items_for_ports(tcp_ports: Sequence[int]) -> List[str]:
     return [f"TCP {port}/{service_name(port)}: {REVIEW_TCP_PORTS[port]}" for port in tcp_ports if port in REVIEW_TCP_PORTS]
 
 
+# HTTP inventory is deliberately bounded and never follows a device to another IP.
+WEB_MAX_REDIRECTS = 3
+WEB_MAX_REQUESTS = 8
+WEB_TOTAL_TIMEOUT = 10.0
+WEB_HEADER_LIMIT = 16 * 1024
+WEB_BODY_LIMIT = 64 * 1024
+WEB_URL_LIMIT = 2048
+WEB_REDIRECT_CODES = {301, 302, 303, 307, 308}
+
+
+def canonical_web_url(value: str, base: Optional[str] = None) -> str:
+    """Validate before urlsplit (which otherwise silently strips controls)."""
+    if (not isinstance(value, str) or len(value) > WEB_URL_LIMIT or not value
+            or "\\" in value or any(ord(char) < 33 or ord(char) == 127 for char in value)):
+        raise ValueError("Invalid, oversized, or unsafe web URL")
+    url = urllib.parse.urljoin(base, value) if base else value
+    if len(url) > WEB_URL_LIMIT:
+        raise ValueError("Redirect URL exceeds length limit")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or parsed.username is not None or parsed.password is not None:
+        raise ValueError("Only credential-free HTTP/HTTPS URLs are allowed")
+    hostname = parsed.hostname
+    if not hostname or ":" in hostname:
+        raise ValueError("An IPv4 address or DNS hostname is required")
+    hostname = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    if len(hostname) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                                      for label in hostname.split(".")):
+        raise ValueError("Invalid redirect hostname")
+    port = parsed.port
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid redirect port")
+    decoded_path = urllib.parse.unquote(parsed.path + parsed.query)
+    if any(ord(char) < 32 or ord(char) == 127 for char in decoded_path):
+        raise ValueError("Control character in redirect path/query")
+    authority = hostname + (f":{port}" if port is not None else "")
+    path = urllib.parse.quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+    query = urllib.parse.quote(parsed.query, safe="%/?@!$&'()*+,;=:-._~")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), authority, path, query, ""))
+
+
+def redact_web_url(value: str) -> str:
+    """Never save URL credentials, fragments, or possible session/query tokens."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.username is not None or parsed.password is not None:
+            return "(credential-bearing URL omitted)"
+        return clean_identity_text(urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                                                          "[query-redacted]" if parsed.query else "", "")), WEB_URL_LIMIT)
+    except ValueError:
+        return "(invalid URL)"
+
+
+def meraki_redirect_matches(url: str, mac: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(canonical_web_url(url))
+    except (ValueError, UnicodeError):
+        return False
+    normalized = mac.replace(":", "").replace("-", "").lower()
+    match = re.fullmatch(r"([0-9a-f]{12})\.devices\.meraki\.direct", parsed.hostname or "")
+    return bool(re.fullmatch(r"[0-9a-f]{12}", normalized) and match and
+                match.group(1) == normalized and parsed.scheme == "https" and parsed.port == 8092)
+
+
+async def resolve_web_addresses(hostname: str) -> Set[str]:
+    def lookup():
+        return {item[4][0] for item in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)}
+    return await asyncio.wait_for(background_call(lookup), timeout=1.5)
+
+
+async def approve_web_target(ip: str, url: str, mac: str = "-") -> str:
+    parsed = urllib.parse.urlsplit(canonical_web_url(url))
+    target_ip = str(ipaddress.IPv4Address(ip))
+    hostname = parsed.hostname or ""
+    try:
+        literal = str(ipaddress.ip_address(hostname))
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if literal != target_ip:
+            raise ValueError("Redirect points to another IP; not followed")
+        return "Same scanned IP"
+    # Cisco documents this local, MAC-derived alias, including IP access when
+    # DNS is unavailable. Never resolve/connect elsewhere: socket stays pinned
+    # to the already-scanned IP; advertised host is used only for Host and SNI.
+    if meraki_redirect_matches(url, mac):
+        return "MAC-matched Meraki local alias; connection pinned to scanned IP"
+    addresses = await resolve_web_addresses(hostname)
+    if not addresses or addresses != {target_ip}:
+        raise ValueError("Redirect hostname does not resolve exclusively to the scanned IPv4 address")
+    return "Hostname resolved to scanned IPv4 address; connection pinned"
+
+
 async def open_stream(
-    ip: str,
-    port: int,
-    timeout: float,
-    use_tls: bool = False,
+    ip: str, port: int, timeout: float, use_tls: bool = False,
+    server_hostname: Optional[str] = None,
 ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     ssl_context = None
-    server_hostname = None
     if use_tls:
+        # Read-only inventory, not a certificate validation/security assessment.
+        # No passwords or cookies are sent. Record unverified TLS in observations.
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
     return await asyncio.wait_for(
-        asyncio.open_connection(ip, port, ssl=ssl_context, server_hostname=server_hostname),
-        timeout=timeout,
-    )
+        asyncio.open_connection(ip, port, ssl=ssl_context,
+                                server_hostname=(server_hostname or ip) if use_tls else None,
+                                limit=WEB_HEADER_LIMIT), timeout=timeout)
+
+
+async def read_http_inventory(reader: asyncio.StreamReader) -> Dict[str, object]:
+    for _ in range(3):
+        header_data = await reader.readuntil(b"\r\n\r\n")
+        if len(header_data) > WEB_HEADER_LIMIT:
+            raise ValueError("HTTP header exceeds 16 KiB limit")
+        lines = header_data.decode("iso-8859-1").split("\r\n")
+        match = re.fullmatch(r"HTTP/1\.[01]\s+([1-5][0-9]{2})(?:\s+[^\r\n]*)?", lines[0])
+        if not match:
+            raise ValueError("Invalid HTTP status line")
+        status = int(match.group(1))
+        headers: Dict[str, str] = {}
+        for line in lines[1:]:
+            if not line:
+                continue
+            key, sep, value = line.partition(":")
+            if not sep or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-zA-Z-]+", key):
+                raise ValueError("Invalid HTTP header")
+            key = key.lower()
+            if key in headers and key in {"location", "content-length", "transfer-encoding"}:
+                raise ValueError(f"Ambiguous duplicate {key} header")
+            headers[key] = value.strip()
+        if status < 200 and status != 101:
+            continue
+        break
+    else:
+        raise ValueError("Too many interim HTTP responses")
+    result: Dict[str, object] = {
+        "status": status, "status_line": clean_identity_text(lines[0], 120),
+        "server": clean_identity_text(headers.get("server", ""), 200),
+        "content_type": clean_identity_text(headers.get("content-type", ""), 160),
+        "title": "", "body_truncated": False,
+    }
+    # Redirect decisions never depend on downloading a redirect body.
+    if status in WEB_REDIRECT_CODES:
+        result["location_raw"] = headers.get("location", "")
+        return result
+    if status in {101, 204, 304}:
+        return result
+    if headers.get("content-encoding", "identity").lower() not in {"identity", ""}:
+        result["note"] = "Encoded body not parsed (identity encoding was requested)"
+        return result
+    body = bytearray()
+    transfer = headers.get("transfer-encoding", "").lower()
+    if transfer and transfer != "chunked":
+        result["note"] = "Unsupported transfer encoding; title not parsed"
+        return result
+    if transfer == "chunked":
+        # Bound chunk count as well as bytes to avoid many one-byte frames.
+        for _ in range(2048):
+            line = await reader.readuntil(b"\r\n")
+            if len(line) > 256:
+                raise ValueError("Oversized HTTP chunk header")
+            token = line.split(b";", 1)[0].strip()
+            if not re.fullmatch(rb"[0-9a-fA-F]{1,16}", token):
+                raise ValueError("Invalid HTTP chunk length")
+            size = int(token, 16)
+            if size == 0:
+                break
+            take = min(size, WEB_BODY_LIMIT - len(body))
+            body.extend(await reader.readexactly(take))
+            if take < size or len(body) >= WEB_BODY_LIMIT:
+                result["body_truncated"] = True
+                break
+            if await reader.readexactly(2) != b"\r\n":
+                raise ValueError("Invalid HTTP chunk ending")
+        else:
+            result["body_truncated"] = True
+    else:
+        length_text = headers.get("content-length")
+        if length_text is not None and not re.fullmatch(r"[0-9]{1,20}", length_text):
+            raise ValueError("Invalid HTTP Content-Length")
+        expected = int(length_text) if length_text is not None else None
+        maximum = min(expected, WEB_BODY_LIMIT) if expected is not None else WEB_BODY_LIMIT
+        while len(body) < maximum:
+            chunk = await reader.read(min(8192, maximum - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+        result["body_truncated"] = ((expected is not None and len(body) < expected) or
+                                    (expected is None and len(body) == WEB_BODY_LIMIT))
+    encoding = "utf-8"
+    charset = re.search(r"charset=[\"']?([\w-]+)", str(result["content_type"]), re.I)
+    if charset and charset.group(1).lower() in {"utf-8", "us-ascii", "iso-8859-1", "windows-1252"}:
+        encoding = charset.group(1)
+    text = bytes(body).decode(encoding, "replace")
+    title = re.search(r"<title\b[^>]*>(.*?)</title\s*>", text, re.I | re.S)
+    if title:
+        result["title"] = clean_identity_text(html.unescape(re.sub(r"<[^>]+>", " ", title.group(1))), 200)
+    return result
+
+
+async def fetch_http_inventory(ip: str, url: str, timeout: float) -> Dict[str, object]:
+    """One GET; caller validates scope. Connect by IP, not a second DNS lookup."""
+    parsed = urllib.parse.urlsplit(canonical_web_url(url))
+    writer = None
+    async def request():
+        nonlocal writer
+        reader, writer = await open_stream(ip, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                          timeout, parsed.scheme == "https", parsed.hostname)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        writer.write((f"GET {path} HTTP/1.1\r\nHost: {parsed.netloc}\r\n"
+                      f"User-Agent: PyNetScan/{VERSION}\r\nAccept: text/html,*/*;q=0.1\r\n"
+                      "Accept-Encoding: identity\r\nConnection: close\r\n\r\n").encode("ascii"))
+        await writer.drain()
+        return await read_http_inventory(reader)
+    try:
+        return await asyncio.wait_for(request(), timeout=timeout)
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.3)
+            except (OSError, asyncio.TimeoutError):
+                pass
+
+
+def apply_web_identity(host: Host) -> None:
+    """Only label evidence-supported inferences; never overwrite an actual name."""
+    vendor = host.vendor_guess
+    source = ""
+    evidence = list(host.identification_evidence)
+    for observation in host.web_observations:
+        if observation.get("outcome") != "response":
+            continue
+        location = str(observation.get("location", ""))
+        if observation.get("status") in WEB_REDIRECT_CODES and meraki_redirect_matches(location, host.mac):
+            vendor = "Cisco Meraki"
+            source = "MAC-matched Meraki HTTP redirect"
+            evidence.append("Cisco Meraki inferred from devices.meraki.direct redirect matching the observed MAC; model and configured hostname not established")
+        title = str(observation.get("title", ""))
+        # Do not use a generic login/error title or a arbitrary Server header as
+        # a device name. These are curated product hints, not authenticated facts.
+        for pattern, candidate in (
+            (r"\bcisco\s+meraki\b", "Cisco Meraki"),
+            (r"\bforti(?:gate|net)\b", "Fortinet"),
+            (r"\bsynology\b", "Synology"),
+            (r"\bqnap\b", "QNAP"),
+        ):
+            if re.search(pattern, title, re.I) and not vendor and 200 <= int(observation.get("status", 0)) < 300:
+                vendor = candidate
+                source = "Device web page title"
+                evidence.append(f"{candidate} inferred from web title: {clean_identity_text(title, 120)}")
+    host.identification_evidence = list(dict.fromkeys(evidence))[:16]
+    host.vendor_guess = vendor
+    placeholder = host.name in {"", "-", "(unknown)"} or (host.name.startswith("(") and host.name.endswith(")"))
+    if vendor and (placeholder or host.name_is_inferred) and host.name_source != "Alias" and not host.resolved_name:
+        host.name = f"{vendor} device"
+        host.name_is_inferred = True
+        host.name_source = "Inferred: " + (source or "retained web evidence")
+
+
+def set_name_metadata(host: Host, aliases: Dict[str, str], mdns: Dict[str, Set[str]]) -> None:
+    host.name_is_inferred = False
+    host.resolved_name = ""
+    if aliases.get(host.ip):
+        host.name_source = "Alias"
+    elif host.name in mdns.get(host.ip, set()):
+        host.resolved_name, host.name_source = host.name, "mDNS"
+    elif host.name and host.name != "-" and not host.name.startswith("("):
+        host.resolved_name, host.name_source = host.name, "DNS/NetBIOS or device-advertised name"
+    elif host.manufacturer != "-":
+        host.name_source = "Manufacturer placeholder (not a hostname)"
+        host.name_is_inferred = True
+    else:
+        host.name_source = "Not discovered"
+
+
+def web_banner_summary(observation: Dict[str, object]) -> str:
+    parts = [str(observation.get("status_line") or observation.get("outcome", "unknown"))]
+    for field_name, label in (("location", "Location"), ("server", "Server"), ("title", "Title")):
+        if observation.get(field_name):
+            parts.append(f"{label}={observation[field_name]}")
+    if observation.get("error"):
+        parts.append(str(observation["error"]))
+    return " | ".join(parts)[:2800]
+
+
+async def collect_web_identity(
+    host: Host, timeout: float, semaphore: asyncio.Semaphore,
+    cancel_event: Optional[asyncio.Event] = None, start_urls: Optional[Sequence[str]] = None,
+) -> None:
+    eligible = sorted((port for port in host.open_tcp_ports if port in HTTP_PORTS),
+                      key=lambda port: ({80: 0, 443: 1, 8080: 2, 8443: 3}.get(port, 4), port))
+    urls = list(start_urls) if start_urls is not None else [
+        f"{'https' if port in HTTPS_PORTS else 'http'}://{host.ip}:{port}/" for port in eligible]
+    if not urls:
+        host.web_identification_status = "no_eligible_open_ports"
+        return
+    host.web_identification_status = "queued"
+    current_observation = None
+    async def perform():
+        nonlocal current_observation
+        seen: Set[str] = set()
+        host.web_identification_status = "complete"
+        for first in urls:
+            current = canonical_web_url(first)
+            for hop in range(WEB_MAX_REDIRECTS + 1):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError()
+                if current in seen:
+                    if current_observation:
+                        current_observation["redirect_action"] = "loop_not_followed"
+                    break
+                if len(host.web_observations) >= WEB_MAX_REQUESTS:
+                    host.web_identification_status = "limited"
+                    if current_observation:
+                        current_observation["redirect_action"] = "request_limit"
+                    return
+                try:
+                    policy = await approve_web_target(host.ip, current, host.mac)
+                except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+                    if current_observation:
+                        current_observation["redirect_action"] = "blocked"
+                        current_observation["redirect_reason"] = clean_identity_text(str(exc), 240)
+                    host.web_identification_status = "limited"
+                    break
+                if current_observation and current_observation.get("location"):
+                    current_observation["redirect_action"] = "followed"
+                seen.add(current)
+                parsed = urllib.parse.urlsplit(current)
+                observation: Dict[str, object] = {
+                    "url": redact_web_url(current), "hostname": parsed.hostname,
+                    "port": parsed.port or (443 if parsed.scheme == "https" else 80),
+                    "scheme": parsed.scheme, "connect_ip": host.ip, "scope_policy": policy,
+                    "outcome": "attempted", "status": None,
+                    "tls_validation": "not_verified_inventory_only" if parsed.scheme == "https" else "not_applicable",
+                }
+                current_observation = observation
+                host.web_observations.append(observation)
+                try:
+                    response = await fetch_http_inventory(host.ip, current, timeout)
+                    raw_location = str(response.pop("location_raw", ""))
+                    observation.update(response)
+                    observation["outcome"] = "response"
+                    if raw_location:
+                        try:
+                            destination = canonical_web_url(raw_location, current)
+                        except (ValueError, UnicodeError) as exc:
+                            observation["location"] = "(invalid redirect omitted)"
+                            observation["redirect_action"] = "blocked"
+                            observation["redirect_reason"] = clean_identity_text(str(exc), 240)
+                            break
+                        observation["location"] = redact_web_url(destination)
+                        apply_web_identity(host)
+                        host.banners[f"web {observation['url']}"] = web_banner_summary(observation)
+                        if parsed.scheme == "https" and urllib.parse.urlsplit(destination).scheme == "http":
+                            observation["redirect_action"] = "https_downgrade_not_followed"
+                            break
+                        if hop >= WEB_MAX_REDIRECTS:
+                            observation["redirect_action"] = "redirect_limit"
+                            host.web_identification_status = "limited"
+                            break
+                        current = destination
+                        continue
+                    apply_web_identity(host)
+                except asyncio.CancelledError:
+                    observation["outcome"] = "cancelled"
+                    raise
+                except (OSError, ValueError, UnicodeError, asyncio.TimeoutError, asyncio.IncompleteReadError,
+                        asyncio.LimitOverrunError) as exc:
+                    observation["outcome"] = "timeout" if isinstance(exc, asyncio.TimeoutError) else "error"
+                    observation["error"] = clean_identity_text(f"{type(exc).__name__}: {exc}", 240)
+                finally:
+                    host.banners[f"web {observation['url']}"] = web_banner_summary(observation)
+                break
+            current_observation = None
+    try:
+        async with semaphore:
+            await asyncio.wait_for(perform(), timeout=WEB_TOTAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        host.web_identification_status = "limited"
+        if current_observation and current_observation.get("outcome") in {"attempted", "cancelled"}:
+            current_observation["outcome"] = "timeout"
+            current_observation["error"] = "Host web-identification time budget exhausted"
+    except asyncio.CancelledError:
+        host.web_identification_status = "cancelled"
+        raise
+    finally:
+        apply_web_identity(host)
 
 
 async def grab_banner(ip: str, port: int, timeout: float, semaphore: asyncio.Semaphore) -> Optional[str]:
     if port not in HTTP_PORTS and port not in GREETING_PORTS:
         return None
-
     async with semaphore:
-        reader = None
         writer = None
         try:
             if port in HTTP_PORTS:
-                reader, writer = await open_stream(ip, port, timeout, port in HTTPS_PORTS)
-                request = (
-                    f"GET / HTTP/1.0\r\nHost: {ip}\r\n"
-                    f"User-Agent: PyNetScan/{VERSION}\r\nConnection: close\r\n\r\n"
-                ).encode()
-                writer.write(request)
-                await writer.drain()
-                data = await asyncio.wait_for(reader.read(8192), timeout=timeout)
-                text = data.decode("utf-8", "ignore")
-                status = text.splitlines()[0].strip() if text.splitlines() else "HTTP response"
-                server_match = re.search(r"(?im)^Server:\s*(.+)$", text)
-                title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
-                parts = [status]
-                if server_match:
-                    parts.append(f"Server={server_match.group(1).strip()}")
-                if title_match:
-                    title = re.sub(r"\s+", " ", title_match.group(1)).strip()
-                    if title:
-                        parts.append(f"Title={title[:120]}")
-                return " | ".join(parts)[:300]
-
+                url = f"{'https' if port in HTTPS_PORTS else 'http'}://{ip}:{port}/"
+                observation = await fetch_http_inventory(ip, url, timeout)
+                location = observation.pop("location_raw", "")
+                if location:
+                    observation["location"] = redact_web_url(canonical_web_url(str(location), url))
+                return web_banner_summary(observation)
             reader, writer = await open_stream(ip, port, timeout, port in {465, 993, 995})
             data = await asyncio.wait_for(reader.read(512), timeout=timeout)
-            banner = re.sub(r"\s+", " ", data.decode("utf-8", "ignore")).strip()
-            return banner[:300] if banner else None
-        except (OSError, ssl.SSLError, asyncio.TimeoutError):
+            banner = clean_identity_text(data.decode("utf-8", "ignore"), 300)
+            return banner or None
+        except (OSError, ValueError, UnicodeError, asyncio.TimeoutError,
+                asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             return None
         finally:
             if writer:
@@ -1829,19 +2328,19 @@ async def grab_banner(ip: str, port: int, timeout: float, semaphore: asyncio.Sem
 
 
 async def collect_banners(
-    ip: str,
-    open_ports: Sequence[int],
-    timeout: float,
-    semaphore: asyncio.Semaphore,
+    ip: str, open_ports: Sequence[int], timeout: float, semaphore: asyncio.Semaphore,
 ) -> Dict[str, str]:
     eligible = [port for port in open_ports if port in HTTP_PORTS or port in GREETING_PORTS]
     tasks = [asyncio.create_task(grab_banner(ip, port, timeout, semaphore)) for port in eligible]
-    values = await asyncio.gather(*tasks, return_exceptions=True)
-    banners: Dict[str, str] = {}
-    for port, value in zip(eligible, values):
-        if isinstance(value, str) and value:
-            banners[f"{port}/tcp"] = value
-    return banners
+    try:
+        values = await asyncio.gather(*tasks, return_exceptions=True)
+        return {f"{port}/tcp": value for port, value in zip(eligible, values) if isinstance(value, str) and value}
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 
 # ============================================================
 # SCANNING ENGINE
@@ -2143,6 +2642,7 @@ async def scan_subnet(options: ScanOptions, progress: Dict[str, object], cancel_
     discovery_method = "Not started"
     fatal_error = False
     aliases = load_aliases()
+    oui: Dict[str, str] = OUIDatabase()
     try:
         if not cancel_event.is_set():
             if options.enable_oui:
@@ -2203,12 +2703,17 @@ async def scan_subnet(options: ScanOptions, progress: Dict[str, object], cancel_
             controller.warn(f"Manufacturer lookup unavailable: {exc}")
         for host in hosts.values():
             host.manufacturer = oui_lookup(host.mac, oui) if options.enable_oui else "-"
+            host.manufacturer_source = getattr(oui, "source", "Manufacturer database") if oui else ""
+            host.manufacturer_lookup_status = ("disabled" if not options.enable_oui else
+                "database_unavailable" if not oui else "no_mac_address" if host.mac == "-" else
+                "matched" if host.manufacturer != "-" else "no_assignment_found")
             if host.name == "(unknown)" and host.manufacturer != "-":
                 host.name = f"({host.manufacturer})"
 
         progress.update(stage="Identifying devices", done=0, total=max(1, len(hosts)))
         host_iterator = iter(hosts.values())
         banner_semaphore = asyncio.Semaphore(min(controller.concurrency, 100))
+        web_semaphore = asyncio.Semaphore(min(controller.concurrency, 16))
 
         async def identify_worker() -> None:
             while not cancel_event.is_set():
@@ -2220,11 +2725,18 @@ async def scan_subnet(options: ScanOptions, progress: Dict[str, object], cancel_
                     progress["done"] = int(progress["done"]) + 1
                     continue
                 host.name = await resolve_name(host.ip, mdns_h, aliases, host.manufacturer, host.ssdp_meta, options.enable_dns)
+                set_name_metadata(host, aliases, mdns_h)
                 if cancel_event.is_set():
                     return
-                if options.enable_banners and host.open_tcp_ports:
-                    host.banners = await collect_banners(host.ip, host.open_tcp_ports,
-                        max(0.8, min(options.tcp_timeout * 4, 3.0)), banner_semaphore)
+                if options.enable_web_identification:
+                    await collect_web_identity(host, max(1.5, min(options.tcp_timeout * 4, 3.0)),
+                                               web_semaphore, cancel_event)
+                if options.enable_banners and host.open_tcp_ports and not cancel_event.is_set():
+                    # HTTP is handled above with safe redirect and evidence tracking;
+                    # --no-web-identification must not secretly request HTTP banners.
+                    greeting_ports = [port for port in host.open_tcp_ports if port in GREETING_PORTS and port not in HTTP_PORTS]
+                    host.banners.update(await collect_banners(host.ip, greeting_ports,
+                        max(0.8, min(options.tcp_timeout * 4, 3.0)), banner_semaphore))
                 host.identification_complete = True
                 progress["done"] = int(progress["done"]) + 1
 
@@ -2252,7 +2764,7 @@ async def scan_subnet(options: ScanOptions, progress: Dict[str, object], cancel_
         update_host_observations(host, options, observed_at)
         host.scan_completed_at = observed_at
         host.scan_cancelled = cancel_event.is_set()
-        host.device_type = classify_device(host.name, host.manufacturer, host.open_tcp_ports,
+        host.device_type = classify_device(host.name, host.manufacturer + " " + host.vendor_guess, host.open_tcp_ports,
             host.open_udp_ports, host.mdns_services, host.ssdp_meta, host.os_guess)
         host.status = base_host_status(host)
     progress.update(stage="Cancelled" if cancel_event.is_set() else "Stopped with errors" if fatal_error else "Complete", done=1, total=1)
@@ -2265,7 +2777,12 @@ async def scan_subnet(options: ScanOptions, progress: Dict[str, object], cancel_
         tcp_ports=list(options.tcp_ports), udp_ports=list(options.udp_ports),
         discovery_complete=bool(progress.get("discovery_complete")) and not fatal_error,
         discovery_outcomes=outcomes,
-        settings={"skip_discovery": options.skip_discovery,
+        settings={"web_identification": options.enable_web_identification,
+                  "web_limits": {"redirects_per_chain": WEB_MAX_REDIRECTS, "requests_per_host": WEB_MAX_REQUESTS,
+                                 "seconds_per_host": WEB_TOTAL_TIMEOUT, "same_scanned_ip_only": True},
+                  "manufacturer_database": {"available": bool(oui), "source": getattr(oui, "source", "") if oui else "",
+                                            "entries": len(oui)},
+                  "skip_discovery": options.skip_discovery,
                   "discovery_ports": effective_discovery_ports(options),
                   "timeout": options.tcp_timeout, "adaptive_timeout": options.adaptive_timeout,
                   "max_retries": options.max_retries, "max_rate": options.max_rate,
@@ -2341,6 +2858,8 @@ def compare_reports(previous: Optional[ScanReport], current: ScanReport) -> Scan
             changes.append(f"Name changed: {old.name} -> {host.name}")
         elif host.name == "(unknown)" or (not host.identification_complete and host.name.startswith("(")):
             host.name = old.name
+            host.name_source = "Last-known name (not reverified)"
+            host.name_is_inferred = old.name_is_inferred
         if host.mac != old.mac and host.mac != "-" and old.mac != "-":
             changes.append(f"MAC changed: {old.mac} -> {host.mac}")
         if not positive and host.reachability == "unknown":
@@ -2367,6 +2886,12 @@ def compare_reports(previous: Optional[ScanReport], current: ScanReport) -> Scan
         host.discovery_complete = False
         host.review_items = []
         host.banners = {}
+        host.web_observations = []
+        host.identification_evidence = []
+        host.vendor_guess = ""
+        host.web_identification_status = "not_requested"
+        host.name_source = "Last-known name (not reverified)"
+        host.manufacturer_lookup_status = "last_known"
         host.mdns_names = []
         host.mdns_services = []
         host.ssdp_locations = []
@@ -2447,6 +2972,9 @@ def export_csv(report: ScanReport, options: ScanOptions) -> str:
             "Identification Complete", "TCP Requested", "UDP Requested",
             "TCP Probe States", "UDP Probe States", "Last-known TCP", "Last-known UDP",
             "TCP Probe Details", "UDP Probe Details",
+            "Name Source", "Name Inferred", "Resolved Name", "Vendor Inference",
+            "Identification Evidence", "Web Identification Status", "Web Observations",
+            "Manufacturer Lookup Status", "Manufacturer Source",
         ])
         for host in sorted(report.hosts.values(), key=lambda item: tuple(map(int, item.ip.split(".")))):
             writer.writerow([
@@ -2475,6 +3003,10 @@ def export_csv(report: ScanReport, options: ScanOptions) -> str:
                 compact_ranges(host.last_known_tcp_ports), compact_ranges(host.last_known_udp_ports),
                 " | ".join(f"{port}: {text}" for port, text in sorted(host.tcp_results.details.items())),
                 " | ".join(f"{port}: {text}" for port, text in sorted(host.udp_results.details.items())),
+                host.name_source, host.name_is_inferred, host.resolved_name, host.vendor_guess,
+                " | ".join(host.identification_evidence), host.web_identification_status,
+                json.dumps(host.web_observations, ensure_ascii=True),
+                host.manufacturer_lookup_status, host.manufacturer_source,
             ])
     return path
 
@@ -2861,18 +3393,19 @@ def draw_list(
         if host.review_items and host.status not in {"PARTIAL", "NOT_SCANNED", "NOT_OBSERVED", "ERROR"}:
             status_marker = "!"
         ports = compact_port_text(host)
+        display_name = ("~ " if host.name_is_inferred else "") + host.name
         if width >= 150:
             line = (
-                f"{status_marker:1} {host.ip:15} {host.name:22.22} {host.device_type:17.17} "
+                f"{status_marker:1} {host.ip:15} {display_name:22.22} {host.device_type:17.17} "
                 f"{host.mac:17} {host.manufacturer:22.22} {host.os_guess:12.12} {ports}"
             )
         elif width >= 105:
             line = (
-                f"{status_marker:1} {host.ip:15} {host.name:22.22} {host.device_type:17.17} "
+                f"{status_marker:1} {host.ip:15} {display_name:22.22} {host.device_type:17.17} "
                 f"{host.manufacturer:20.20} {ports}"
             )
         else:
-            line = f"{status_marker:1} {host.ip:15} {host.name:22.22} {ports}"
+            line = f"{status_marker:1} {host.ip:15} {display_name:22.22} {ports}"
         attribute = curses.A_REVERSE if item_index == index else 0
         safe_addstr(stdscr, start_y + row, 0, line, attribute)
 
@@ -2893,7 +3426,11 @@ def host_detail_lines(host: Host, width: int) -> List[str]:
         f"Reachability:   {host.reachability}",
         f"Last seen:      {host.last_seen or 'no positive observation recorded'}",
         f"Last scan ended: {host.scan_completed_at or 'not recorded'}; cancelled={host.scan_cancelled}",
-        f"Name:           {host.name}",
+        f"Display Name:   {host.name}",
+        f"Name Source:    {host.name_source}; inferred={host.name_is_inferred}",
+        f"Resolved Name:  {host.resolved_name or 'Not discovered (web hostname is separate)'}",
+        f"Vendor Guess:   {host.vendor_guess or 'Not inferred'}",
+        f"Manufacturer lookup: {host.manufacturer_lookup_status}; source={host.manufacturer_source or 'none'}",
         f"Device Type:    {host.device_type}",
         f"MAC:            {host.mac}",
         f"Manufacturer:   {host.manufacturer}",
@@ -2918,6 +3455,20 @@ def host_detail_lines(host: Host, width: int) -> List[str]:
         raw_lines.extend(["", "Changes:"] + [f"  {value}" for value in host.changes])
     if host.review_items:
         raw_lines.extend(["", "Review:"] + [f"  ! {value}" for value in host.review_items])
+    if host.identification_evidence:
+        raw_lines.extend(["", "Identification Evidence (not authenticated):"])
+        raw_lines.extend("  " + value for value in host.identification_evidence)
+    if host.web_observations:
+        raw_lines.extend(["", f"Web identification: {host.web_identification_status}",
+                          "Web requests may reach advertised ports outside the selected TCP scan.",
+                          "Those observations do not change TCP scan scope or per-port probe states."])
+        for item in host.web_observations:
+            raw_lines.append(f"  {item.get('url')}: {item.get('outcome')}; HTTP {item.get('status') or '-'}")
+            if item.get("location"):
+                raw_lines.append(f"    Redirect: {item['location']} ({item.get('redirect_action', 'advertised')})")
+            for key in ("title", "scope_policy", "tls_validation", "error", "redirect_reason"):
+                if item.get(key):
+                    raw_lines.append(f"    {key}: {item[key]}")
     if host.banners:
         raw_lines.extend(["", "Service Information:"])
         raw_lines.extend(f"  {key}: {value}" for key, value in host.banners.items())
@@ -2991,6 +3542,16 @@ def show_help(stdscr, report: ScanReport) -> None:
         "  Generic/malformed replies are unverified_response, not a verified service.",
         "  No UDP response is not proof of closure. UDP refused may be an ICMP intermediary.",
         "",
+        "Web identification (Standard/Deep, or --banners)",
+        "  Retains redirects; follows at most 3 hops, only on the same scanned IP.",
+        "  MAC-matched Meraki local aliases are pinned to that IP with HTTP Host/TLS SNI.",
+        "  Other DNS names must resolve exclusively to that scanned IPv4 address.",
+        "  No login attempts; TLS is unverified inventory, not a trust assessment.",
+        "  Vendor-based display names are inferred, not configured hostnames or models.",
+        "  --no-web-identification disables these extra requests. At most 8/host, 10s.",
+        "  Web endpoints outside the chosen port list do not alter scan probe states.",
+        "  Manufacturer downloads fall back from IEEE to Wireshark; caches are retained.",
+        "",
         "Probe states and comparison",
         "  open / refused / no_response / error / not_scanned are distinct TCP states.",
         "  Only an explicit refusal confirms a closed/refused connection, never a timeout.",
@@ -3008,6 +3569,7 @@ def show_help(stdscr, report: ScanReport) -> None:
         "Result symbols",
         "  + new   * changed   - not observed   ? incomplete/unscanned   E error",
         "  ! service needs review (not proof of a vulnerability)",
+        "  ~ before a display name means inferred, not a resolved hostname",
         "",
         "Warnings from the latest scan:",
     ]
@@ -3056,12 +3618,25 @@ def show_ping(stdscr, ip: str) -> None:
 
 
 def fallback_host_name(host: Host) -> str:
+    host.name_source = "Not discovered"
+    host.name_is_inferred = False
+    if host.resolved_name:
+        host.name_source = "Previously resolved name"
+        return host.resolved_name
     if host.mdns_names:
+        host.name_source = "mDNS"
         return host.mdns_names[0]
     ssdp_name = ssdp_friendly_name(host.ssdp_meta)
     if ssdp_name:
+        host.name_source = "Device-advertised SSDP name"
         return ssdp_name
+    if host.vendor_guess:
+        host.name_source = "Inferred from web evidence"
+        host.name_is_inferred = True
+        return f"{host.vendor_guess} device"
     if host.manufacturer != "-":
+        host.name_source = "Manufacturer placeholder (not a hostname)"
+        host.name_is_inferred = True
         return f"({host.manufacturer})"
     return "(unknown)"
 
@@ -3075,6 +3650,8 @@ def edit_alias(stdscr, host: Host) -> str:
     if value:
         aliases[host.ip] = value
         host.name = value
+        host.name_source = "Alias"
+        host.name_is_inferred = False
         message = f"Alias saved for {host.ip}"
     else:
         aliases.pop(host.ip, None)
@@ -3133,6 +3710,8 @@ def build_scan_options(args, stdscr) -> ScanOptions:
         enable_mdns=not args.no_mdns,
         enable_ssdp=not args.no_ssdp,
         enable_banners=args.banners or profile == "deep",
+        enable_web_identification=(not args.no_web_identification and
+                                   (profile in {"standard", "deep"} or args.banners)),
         force=args.force,
         update_oui=args.update_oui,
         enable_oui=not args.no_oui,
@@ -3368,3 +3947,4 @@ if __name__ == "__main__":
         curses.wrapper(main, cli_args)
     except KeyboardInterrupt:
         pass
+
