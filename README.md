@@ -2,13 +2,13 @@
 
 A standalone Linux network scanner with an interactive terminal interface, written in Python.
 
-**Version: 2.1.0**
+**Version: 2.2.0**
 
 PyNetScan discovers devices, scans TCP ports, optionally probes UDP services, identifies hostnames and manufacturers, collects basic service information, and displays the results in a searchable TUI.
 
 Download one `netscan.py` file and run it. No application installation, database, or background service is required. Python, the Linux networking tools, and an interactive terminal are still needed.
 
-This README describes the behavior of [netscan.py](netscan.py) in version 2.1.0. Run `python3 netscan.py --help` to view the options supported by your downloaded copy.
+This README describes the behavior of [netscan.py](netscan.py) in version 2.2.0. Run `python3 netscan.py --help` to view the options supported by your downloaded copy.
 
 ## Features
 
@@ -26,18 +26,18 @@ This README describes the behavior of [netscan.py](netscan.py) in version 2.1.0.
 - CSV and JSON exports with state, timing, and completion information
 - Large-scan warnings and confirmation
 
-## What's new in 2.1.0
+## What's new in 2.2.0
 
-- **More accurate results:** distinguish open, refused, no response, not scanned, and error instead of treating every unsuccessful check alike.
-- **Safer refresh comparisons:** cancelling a scan or omitting a port does not establish that a previously open port closed. Earlier positive results are retained separately as last-known information when they cannot be reverified.
-- **Improved discovery:** explicit TCP refusals count as responsiveness evidence. Use `--discovery-ports` to select discovery ports or `--skip-discovery` to check every target without a discovery prerequisite.
-- **Identification fixes:** corrected mDNS callbacks and cleanup, removed misleading SSDP names derived from USN suffixes, and added structured NetBIOS response parsing.
-- **Protocol-aware UDP results:** validate supported responses and distinguish unverified replies. Optional read-only SNMPv2c requires an explicitly supplied community; no communities are guessed.
-- **Better scheduling:** a shared worker pool distributes the connection budget across active hosts instead of imposing the previous fixed 32-TCP-workers-per-host limit.
-- **Timing and traffic controls:** add `--max-rate`, `--max-retries`, and adaptive timing overrides, with concurrency reduced when the local file-descriptor budget requires it.
-- **More complete exports:** CSV adds observation and completion fields. JSON uses schema version 2 with compact per-state port ranges.
+- **Redirect-aware web identification:** retain HTTP redirect destinations and inspect advertised HTTP/HTTPS endpoints, including nonstandard ports, within strict same-device limits.
+- **Meraki local-page recognition:** recognize a `devices.meraki.direct` redirect whose embedded MAC matches the observed device MAC. Preserve the advertised hostname for HTTP Host and TLS SNI while connecting to the scanned IP. This can provide a vendor-based display name even if the destination page cannot be reached.
+- **Useful, labeled display names:** recognized vendor/product page titles can support an inferred label. Generic login titles do not replace missing hostnames. Aliases and resolved names retain priority. A `~` marker in the list means the display name is inferred.
+- **Automatic Standard/Deep web checks:** lightweight web identification now runs for these profiles without `--banners`. Other profiles can enable it with `--banners`; `--no-web-identification` explicitly disables web requests.
+- **Manufacturer download fallback:** try IEEE first and Wireshark if the primary source fails. Validate publisher downloads, retain working caches, and support longest-prefix matches for 24-, 28-, and 36-bit assignments.
+- **Identification provenance:** details and exports distinguish registry manufacturer data, inferred vendor, resolved name, advertised web hostname, attempted/answered endpoints, and lookup availability.
 
-The application remains a single file. No required third-party Python dependency was added.
+The probe states, partial-result handling, UDP validation, scheduling, and controls added in 2.1.0 remain. This update does not implement the other previously discussed DNS-queue, richer mDNS, SSDP-description, ICMP-OS, or expanded SNMP ideas.
+
+Everything remains in the single `netscan.py` file. **No `curl`, Wireshark executable, or additional required Python package is needed.** The Wireshark fallback downloads a data file, not software.
 
 ## Installation
 
@@ -130,8 +130,8 @@ A single address can be selected with `/32`:
 | --- | --- |
 | `discover` | Find responsive devices without a general TCP port scan. Discovery can still send ICMP and TCP probes. |
 | `quick` | Check a smaller set of common TCP services. |
-| `standard` | Check the broader built-in list of common TCP services. |
-| `deep` | Check TCP ports 1–1024 plus selected higher ports and enable basic banner detection. |
+| `standard` | Check the broader built-in list of common TCP services and run lightweight web identification. |
+| `deep` | Check TCP ports 1–1024 plus selected higher ports, web identification, and basic service greetings. |
 | `full` | Check all TCP ports 1–65535 on selected hosts. This is not a full UDP scan. |
 | `custom` | Check the TCP ports supplied with `--ports`. |
 
@@ -181,6 +181,64 @@ To check every selected address without requiring discovery success:
 ```
 
 `--scan-all-targets` is an alias for `--skip-discovery`. Supply at least one TCP or UDP port with this mode. A target is not considered responsive merely because it was selected for scanning. Large-scan safeguards still apply.
+
+## Web identification and redirects
+
+Standard and Deep scans automatically inspect open ports in the built-in HTTP service set. They start with a small read-only HTTP/HTTPS request and retain the status, selected headers, page title, and redirect information. This is an additional identification stage, not a broad web crawl or authenticated audit.
+
+```bash
+./netscan.py --network 192.168.50.0/24 --profile standard
+```
+
+Quick, Custom, Full, and Discover do not automatically enable this stage. `--banners` enables it where an eligible open port was actually found; Discover has no general port scan to supply such ports.
+
+```bash
+./netscan.py --network 192.168.50.1/32 --ports 80,443 --banners
+```
+
+Disable HTTP identification, including redirects, explicitly:
+
+```bash
+./netscan.py --network 192.168.50.0/24 --profile standard --no-web-identification
+```
+
+`--no-web-identification` takes precedence over `--banners` for HTTP/HTTPS requests. Non-HTTP greetings can still run when banners are enabled.
+
+### Scope and limits
+
+- Follow at most **three redirect hops per chain**, with at most **eight web requests per host** and a **10-second web-work budget per host** after acquiring its web worker. Each request also has a shorter timeout. Scheduling and bounded connection cleanup are additional overhead.
+- Limit response headers to **16 KiB** and sampled response bodies to **64 KiB**. Bodies are not saved; only selected identification information is retained. Encoded bodies that ignore the requested identity encoding are not parsed for titles.
+- A literal-IP redirect must target the **same scanned IP**, not merely another address on the same subnet. A general DNS hostname must resolve exclusively to that scanned IPv4 address. Connections are pinned to that IP after the check so a second hostname lookup cannot change the destination.
+- A MAC-matched Meraki local-status alias is a supported exception to requiring DNS resolution: the scanner still connects only to the scanned IP, using the advertised name for Host/SNI. An alias with a different MAC does not get this exception.
+- Reject non-HTTP schemes, embedded URL credentials, invalid URLs, off-target redirects, redirect loops, and HTTPS-to-HTTP downgrade redirects. Do not send authentication credentials or propagate response cookies. No login attempts are made.
+- An advertised redirect **can lead to a port outside the selected TCP scan list**. The read-only web stage may request that endpoint, but it records the observation separately and does not rewrite the original TCP scan scope or mark an untested port open in `tcp_results`.
+- `--no-dns` disables reverse-name lookups; it does not disable the bounded forward lookup needed to validate general redirect hostnames. Disable web identification to prevent those redirect-related lookups and requests.
+- Web requests are not included in `--max-rate`, which caps TCP/UDP discovery and port probes. They have their own bounded concurrency and limits.
+
+For example, a redirect on TCP 80 may advertise HTTPS on TCP 8092 even when 8092 was not selected for a port scan. An HTTP response from that destination is recorded in `web_observations`; failure to reach it is recorded as a timeout/error, not proof of a closed port. The redirect itself remains useful evidence either way.
+
+### Names and confidence
+
+The `name` field is a display label, not necessarily a hostname. A `~` marker precedes inferred display names in the list. Details show `name_source`, `name_is_inferred`, the separately resolved name, and the evidence behind a vendor estimate.
+
+An illustrative result is:
+
+```text
+Display Name:   Cisco Meraki device
+Name Source:    Inferred: MAC-matched Meraki HTTP redirect
+Resolved Name:  Not discovered
+Vendor Guess:   Cisco Meraki
+```
+
+This does **not** reveal the configured dashboard name or exact model. A MAC-derived web hostname is kept as an advertised endpoint, not silently promoted to a configured hostname. Registry manufacturer information remains separate from a web-inferred vendor.
+
+Recognized vendor/product titles currently include Cisco Meraki, Fortinet/FortiGate, Synology, and QNAP. Other titles remain visible as observations without automatically becoming a device name. Generic titles such as `Login` and generic `Server` headers do not establish identity.
+
+### TLS limitations
+
+HTTPS collection retains the existing inventory behavior of accepting unverified certificates; `tls_validation` explicitly reports `not_verified_inventory_only`. Preserving SNI is **not** certificate verification. No certificate-trust, hostname-validation, or vulnerability conclusion should be drawn from a successful request. Web identity information can be spoofed and is labeled as inference rather than authenticated identity.
+
+The Meraki local-status behavior is documented by [Cisco Meraki](https://documentation.meraki.com/Platform_Management/Dashboard_Administration/Troubleshooting_and_Support/Troubleshooting/Cisco_Meraki_Local_Status_Page_Security_and_SD-WAN).
 
 ## UDP probes
 
@@ -256,7 +314,7 @@ Use a fixed per-attempt timeout, a probe-rate cap, and one retry:
 | `--concurrency N` | Requested active-host limit. |
 | `--port-concurrency N` | Requested global port-worker/connection budget. |
 
-**`--max-rate` is not a total packet-rate limit.** ARP, ICMP, multicast discovery, name resolution, and banner collection are separate traffic. A probe can also involve multiple packets.
+**`--max-rate` is not a total packet-rate limit.** ARP, ICMP, multicast discovery, name resolution, HTTP redirect/page requests, and other banner collection are separate traffic. A probe can also involve multiple packets.
 
 ## Common examples
 
@@ -266,7 +324,7 @@ Run a general inventory:
 ./netscan.py --network 192.168.50.0/24 --profile standard
 ```
 
-Enable banner collection without selecting Deep:
+Add service greetings to Standard's automatic web identification:
 
 ```bash
 ./netscan.py --network 192.168.50.0/24 --profile standard --banners
@@ -309,8 +367,8 @@ usage: netscan.py [-h] [-n NETWORK]
                   [--max-rate MAX_RATE] [--max-retries MAX_RETRIES]
                   [--no-adaptive-timeout] [--snmp-community-env VARIABLE]
                   [--no-dns] [--no-mdns] [--no-ssdp] [--banners]
-                  [--output OUTPUT] [--json] [--force] [--no-menu]
-                  [--update-oui] [--no-oui] [--version]
+                  [--no-web-identification] [--output OUTPUT] [--json]
+                  [--force] [--no-menu] [--update-oui] [--no-oui] [--version]
 
 PyNetScan - standalone Linux network scanner with a TUI
 
@@ -355,7 +413,10 @@ options:
   --no-dns              Disable reverse DNS
   --no-mdns             Disable mDNS discovery
   --no-ssdp             Disable SSDP discovery
-  --banners             Enable basic service/banner detection
+  --banners             Enable service greetings and web identification
+  --no-web-identification
+                        Disable HTTP identity/redirect requests (automatic for
+                        Standard/Deep)
   --output OUTPUT       Preferred export filename or base path
   --json                Automatically export JSON after scanning
   --force               Skip large-scan confirmation
@@ -366,6 +427,8 @@ options:
 ```
 
 `--no-dns` disables reverse DNS, not every naming mechanism. NetBIOS is separate, as are mDNS and SSDP with their own flags. Likewise, `--no-ssdp` disables multicast SSDP discovery; it does not remove an explicit `1900` from `--udp-ports`.
+
+The device list prefixes inferred display names with `~`; open Details to see the source and supporting evidence.
 
 ## TUI keyboard controls
 
@@ -483,20 +546,28 @@ The `~` directory belongs to the account running the scanner. For root, this is 
 
 ## Manufacturer database
 
-PyNetScan uses the IEEE OUI database to look up MAC manufacturers. Its cache is stored in:
+PyNetScan first downloads the [IEEE assignment CSV](https://standards-oui.ieee.org/oui/oui.csv). If the request or validation fails, it tries the [Wireshark manufacturer data file](https://www.wireshark.org/download/automated/data/manuf.gz) over HTTPS. The fallback is not an executable or optional package dependency.
+
+The downloader limits transfer size and time, rejects invalid/incomplete responses, and checks the parsed assignment count before replacing its cache. HTML error pages are not accepted as databases. Wireshark-format 24-, 28-, and 36-bit assignments use longest-prefix matching; exact unmasked device MAC entries are not generalized into vendor prefixes.
+
+The cache remains:
 
 ```text
 ~/.cache/netscan/oui.json
 ```
 
-It refreshes automatically after its configured maximum age, which defaults to 30 days. Request a refresh or disable lookups with:
+A successful cache is reused for **30 days** by default, including after a fallback download. This avoids downloading it on every scan. Do not repeatedly force refreshes; the Wireshark publisher asks clients not to download its weekly dataset more often than needed.
 
 ```bash
-./netscan.py --update-oui
-./netscan.py --no-oui
+./netscan.py --profile standard --update-oui
+./netscan.py --profile standard --no-oui
 ```
 
-These options apply when a scan runs; they are not separate update-and-exit commands. A download failure is reported, and usable cached information can remain available.
+These options apply when a scan runs; they are not separate update-and-exit commands. If both publishers fail, a usable earlier cache remains intact. Without one, the scan continues and reports that the database is unavailable. A missing MAC, unavailable database, disabled lookup, and no matching assignment are distinguished in host details and exports.
+
+The cache records its publisher and format metadata. Existing 2.1.0 flat caches can be read; successful new downloads use cache format 2. If rolling back to a release that cannot read this format, move the generated cache aside and let that release rebuild it. Cache files are local runtime data, not files to commit to GitHub.
+
+A manufacturer match identifies an address-block registrant, not an exact model or assigned hostname. Web-inferred vendor information is shown separately and does not overwrite the registry field.
 
 ## Exports
 
@@ -529,13 +600,17 @@ Exports write to the selected path and can replace an existing file. Use distinc
 
 ### CSV
 
-The original inventory columns remain, with additional columns for reachability, last-seen time, host completion/cancellation, per-stage completion, requested port counts, probe-state summaries, last-known ports, and probe details.
+The original inventory columns remain, with additional columns for reachability, last-seen time, host completion/cancellation, per-stage completion, requested port counts, probe-state summaries, last-known ports, and probe details. Version 2.2.0 appends Name Source, Name Inferred, Resolved Name, Vendor Inference, Identification Evidence, Web Identification Status, Web Observations, Manufacturer Lookup Status, and Manufacturer Source.
 
 Existing consumers that assume an exact column count should be updated for the appended columns. The `TCP Ports` and `UDP Responded` columns contain current observations; last-known ports have separate columns.
 
 ### JSON
 
-JSON uses **`schema_version: 2`**. It includes scan scope/settings, warnings, discovery outcomes, cancellation, and per-host observations.
+JSON retains **`schema_version: 2`** and adds optional identification fields without changing the existing probe-state encoding. It includes scan scope/settings, warnings, discovery outcomes, cancellation, and per-host observations.
+
+New host fields include `name_source`, `name_is_inferred`, `resolved_name`, `vendor_guess`, `identification_evidence`, `web_observations`, `web_identification_status`, `manufacturer_lookup_status`, and `manufacturer_source`. Each web observation records its original target IP, advertised hostname, URL, scheme, port, outcome, received HTTP status, redirect handling, and relevant errors/limits. URL query values and fragments are not retained; credential-bearing URLs are rejected. Response cookies and raw page bodies are not saved.
+
+Web observations from a missing device are cleared on refresh rather than being presented as fresh evidence. Retained names are labeled last-known when they were not reverified. A web-stage completion value means the bounded stage ended, not that the device supplied a name or model.
 
 `tcp_results` and `udp_results` encode observations in `state_ranges`. Range strings use comma-separated ports and inclusive ranges, such as `22,80,443,8000-8010`. A missing port defaults to `not_scanned`, not `refused` or closed. Use the report's `tcp_ports` and `udp_ports` to determine the requested scope.
 
@@ -543,7 +618,7 @@ The compatibility field `open_udp_ports` contains verified UDP responders; it is
 
 ## Large scans
 
-PyNetScan estimates scan work and warns about large address ranges or high attempt counts. The estimate includes discovery and retry work. A full TCP scan across all usable addresses in a `/24` can exceed 16 million initial port checks before retries.
+PyNetScan estimates scan work and warns about large address ranges or high attempt counts. The estimate includes discovery and retry work; optional web identification is a separately bounded stage. A full TCP scan across all usable addresses in a `/24` can exceed 16 million initial port checks before retries.
 
 `--force` bypasses confirmation; it does not reduce the traffic or authorize the scan. Prefer a small target range and selected ports while validating settings.
 
@@ -580,3 +655,4 @@ Reports can contain sensitive device names, addresses, and service information. 
 ## License
 
 PyNetScan is licensed under the GNU General Public License version 3. See [LICENSE](LICENSE) for the full license text.
+
